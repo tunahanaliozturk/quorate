@@ -2,7 +2,7 @@
 name = "quorate"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 description = "A linearizable key-value store replicated with Raft, tested by deterministic simulation"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/tunahanaliozturk/quorate"
@@ -10,6 +10,14 @@ readme = "README.md"
 keywords = ["raft", "consensus", "distributed", "key-value", "simulation"]
 categories = ["database-implementations", "algorithms"]
 exclude = ["/.github", "/docs"]
+
+[dependencies]
+# Not on crates.io yet, so pinned to a commit. Move to a version once katman is published.
+katman = { git = "https://github.com/tunahanaliozturk/katman", rev = "dd90433d0273ef0d7d87e228813afdb1e0f10f01" }
+
+[dev-dependencies]
+# The simulator runs storage on katman's simulated filesystem.
+katman = { git = "https://github.com/tunahanaliozturk/katman", rev = "dd90433d0273ef0d7d87e228813afdb1e0f10f01", features = ["sim"] }
 
 [lints.rust]
 unsafe_code = "forbid"

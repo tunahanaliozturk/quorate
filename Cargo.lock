@@ -3,5 +3,40 @@
 version = 4
 
 [[package]]
+name = "crc32c"
+version = "0.6.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f132a176423ee852e8f0a35d43088d1850966b50745be818a88b76f64b1c6cb"
+dependencies = [
+ "rustc_version",
+]
+
+[[package]]
+name = "katman"
+version = "0.0.0"
+source = "git+https://github.com/tunahanaliozturk/katman?rev=dd90433d0273ef0d7d87e228813afdb1e0f10f01#dd90433d0273ef0d7d87e228813afdb1e0f10f01"
+dependencies = [
+ "crc32c",
+]
+
+[[package]]
 name = "quorate"
 version = "0.0.0"
+dependencies = [
+ "katman",
+]
+
+[[package]]
+name = "rustc_version"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
+dependencies = [
+ "semver",
+]
+
+[[package]]
+name = "semver"
+version = "1.0.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"

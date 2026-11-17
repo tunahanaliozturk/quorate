@@ -13,6 +13,10 @@ fn position(index: Index) -> Option<usize> {
 }
 
 impl Log {
+    pub(crate) const fn from_entries(entries: Vec<Entry>) -> Self {
+        Self { entries }
+    }
+
     pub(crate) fn entries(&self) -> &[Entry] {
         &self.entries
     }

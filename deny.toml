@@ -30,3 +30,5 @@ allow-wildcard-paths = true
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+# katman, until it is on crates.io.
+allow-git = ["https://github.com/tunahanaliozturk/katman"]

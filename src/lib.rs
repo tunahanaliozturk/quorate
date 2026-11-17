@@ -1,20 +1,32 @@
 //! quorate: a linearizable key-value store replicated with Raft.
 //!
-//! So far the crate holds the Raft core: leader election and log replication as a pure state
-//! machine. Feed a [`Raft`] node [`Input`]s with [`Raft::step`] and carry out the [`Output`]s it
-//! returns. Storage, the key-value layer and the network come in later milestones; see
-//! `docs/roadmap.md`.
+//! So far the crate holds two things. [`Raft`] is the core: leader election and log replication as
+//! a pure state machine. Feed it [`Input`]s with [`Raft::step`] and carry out the [`Output`]s it
+//! returns. [`Storage`] keeps a node's term, vote and log in a katman database. The key-value
+//! layer and the network come in later milestones; see `docs/roadmap.md`.
 //!
 //! ```
-//! use quorate::{Config, Input, NodeId, Output, Raft, Role};
+//! use std::collections::VecDeque;
 //!
-//! // A cluster of one elects itself and commits what it is given.
+//! use quorate::{Config, Input, NodeId, Output, Raft};
+//!
+//! // A cluster of one. This driver has no disk, so it reports every write as durable at once.
 //! let mut node = Raft::new(Config::new(NodeId::new(1), [], 7))?;
-//! while node.role() != Role::Leader {
-//!     node.step(Input::Tick);
+//! let mut inputs: VecDeque<Input> = std::iter::repeat_n(Input::Tick, 20).collect();
+//! inputs.push_back(Input::Propose(b"hello".to_vec()));
+//!
+//! let mut applied = 0;
+//! while let Some(input) = inputs.pop_front() {
+//!     for output in node.step(input) {
+//!         match output {
+//!             Output::Persist(request) => inputs.push_front(Input::Persisted { seq: request.seq() }),
+//!             Output::Apply { .. } => applied += 1,
+//!             _ => {}
+//!         }
+//!     }
 //! }
-//! let outputs = node.step(Input::Propose(b"hello".to_vec()));
-//! assert!(matches!(outputs.as_slice(), [Output::Apply { .. }]));
+//! // The no-op the new leader wrote, then the command.
+//! assert_eq!(applied, 2);
 //! # Ok::<(), quorate::ConfigError>(())
 //! ```
 
@@ -24,8 +36,13 @@ mod raft;
 mod rng;
 #[cfg(test)]
 mod sim;
+mod storage;
 mod types;
 
 pub use config::{Config, ConfigError};
 pub use raft::{Raft, Role};
-pub use types::{AppendOutcome, Entry, Index, Input, Message, NodeId, Output, Payload, Term};
+pub use storage::{Recovered, Storage, StorageError};
+pub use types::{
+    AppendOutcome, Entry, HardState, Index, Input, LogWrite, Message, NodeId, Output, Payload,
+    Persist, PersistSeq, Term,
+};

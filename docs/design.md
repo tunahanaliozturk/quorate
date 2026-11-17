@@ -36,7 +36,7 @@ A struct with one entry point:
 fn step(&mut self, input: Input) -> Vec<Output>;
 ```
 
-`Input` is one of: a message from a peer, a clock tick, a client proposal, a read request, or a confirmation that earlier state reached disk. `Output` is one of: send a message, persist entries or hard state, apply committed entries, answer a client.
+`Input` is one of: a message from a peer, a clock tick, a client proposal, a read request (milestone 4), or a confirmation that earlier state reached disk. `Output` is one of: send a message, persist entries or hard state, apply committed entries, answer a client.
 
 The core has no threads, no sockets, no files, no `Instant::now()` and no global randomness. Election timeouts come from a seeded generator passed in at construction. See [ADR 0001](adr/0001-sans-io-core-and-own-simulator.md).
 
@@ -52,10 +52,10 @@ Protocol features, in the order they are built:
 
 Two katman databases per node.
 
-- **Log database**: Raft log entries keyed by big-endian index, plus the hard state (current term, vote). Opened with `SyncMode::Always`. An entry is acknowledged to the leader only after katman reports it durable. katman's group commit batches concurrent appends into one fsync.
-- **State database**: the key-value data, the client session table and `applied_index`. Each apply writes all three in one `WriteBatch`, so a crash cannot apply an entry twice or skip one.
+- **Log database**: the hard state (current term, vote) under one key, and the Raft log with entry `i` under `l` plus `i` as eight big-endian bytes. Always opened with `SyncMode::Always`. Each write request from the core is one atomic batch. A conflicting tail is replaced in the same batch that writes the new entries. See [ADR 0002](adr/0002-raft-log-in-katman.md).
+- **State database** (milestone 3): the key-value data, the client session table and `applied_index`. Each apply writes all three in one `WriteBatch`, so a crash cannot apply an entry twice or skip one.
 
-Open question for M2: log truncation deletes a range of keys. If katman has no cheap range delete, either katman gains one or the log moves to its own segment files. The answer becomes an ADR.
+The core does not wait for the disk. It emits `Output::Persist` with a sequence number and is told with `Input::Persisted` when that write is durable. Until then it holds back every message, counts its own log towards a quorum only up to its durable index, and applies nothing past that index.
 
 katman is not yet published on crates.io. Until it is, quorate depends on it by git revision.
 
@@ -79,15 +79,16 @@ Faults:
 
 - Message drop, duplication, reordering and delay.
 - Partitions: symmetric, one-way, and a leader isolated from the majority.
-- Node crash and restart. Storage runs on katman's `SimFs`, which discards everything not yet synced.
-- Clock skew between nodes, within a configured bound.
-- Slow disks: persistence confirmations delayed by many ticks.
+- Power cuts. The node loses its memory and every write that had not completed. Storage runs on katman's `SimFs`, which discards unsynced bytes; the node restarts later from what the database holds.
+- Slow disks: a write completes some ticks after it was requested, in request order.
+- Clock skew between nodes, within a configured bound (not built yet).
 
 Checks, after every step:
 
 - **Election safety**: at most one leader per term.
 - **Leader completeness**: a committed entry appears in the log of every later leader.
 - **State machine safety**: no two nodes apply different entries at the same index.
+- **Durable before applied**: no node applies an entry while the write that stores it is still in flight.
 
 Checks, every 32 ticks and at the end (they compare whole logs, which is too slow for every step):
 
@@ -97,7 +98,7 @@ Checks, every 32 ticks and at the end (they compare whole logs, which is too slo
 Checks, at the end of a run:
 
 - **Linearizability**: the recorded client history (invoke and return times, results) is checked against a key-value model.
-- **Liveness**: after faults stop, every node converges on one fully committed log, and a new write then commits everywhere within 50 ticks.
+- **Liveness and durability**: after faults stop and every node is back, all nodes converge on one fully committed log that holds every entry any node ever applied, and a new write then commits everywhere within 50 ticks.
 
 A failing run prints its seed. Setting `QUORATE_SEED=N` replays that run step for step.
 
