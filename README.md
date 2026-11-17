@@ -1,8 +1,8 @@
-# kurultay
+# quorate
 
 A linearizable key-value store for Rust, replicated with Raft and stored in [katman](https://github.com/tunahanaliozturk/katman).
 
-*Kurultay* is the Turkic word for a council that meets to reach a decision. A cluster of nodes does the same for every write.
+A meeting is *quorate* when enough members are present to make a binding decision. A cluster of nodes needs the same for every write.
 
 ## Status
 

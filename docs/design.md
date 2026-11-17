@@ -1,4 +1,4 @@
-# kurultay design
+# quorate design
 
 This document is the contract. Code that disagrees with it is a bug in one of the two, and the fix says which.
 
@@ -57,7 +57,7 @@ Two katman databases per node.
 
 Open question for M2: log truncation deletes a range of keys. If katman has no cheap range delete, either katman gains one or the log moves to its own segment files. The answer becomes an ADR.
 
-katman is not yet published on crates.io. Until it is, kurultay depends on it by git revision.
+katman is not yet published on crates.io. Until it is, quorate depends on it by git revision.
 
 ### Client sessions
 
@@ -69,7 +69,7 @@ A `Transport` trait with two implementations: simulated (in-process queues owned
 
 ### Server and client
 
-A `kurultay` binary that runs one node, and a small client library plus CLI. The client follows leader redirects and retries with its session.
+A `quorate` binary that runs one node, and a small client library plus CLI. The client follows leader redirects and retries with its session.
 
 ## Simulation
 
@@ -95,7 +95,7 @@ Checks, at the end of a run:
 - **Linearizability**: the recorded client history (invoke and return times, results) is checked against a key-value model.
 - **Liveness**: after faults stop, the cluster commits a new write within a bounded number of ticks.
 
-A failing run prints its seed. Setting `KURULTAY_SEED=N` replays that run step for step.
+A failing run prints its seed. Setting `QUORATE_SEED=N` replays that run step for step.
 
 ### Does the simulator catch bugs
 
