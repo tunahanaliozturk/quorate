@@ -36,7 +36,7 @@ A struct with one entry point:
 fn step(&mut self, input: Input) -> Vec<Output>;
 ```
 
-`Input` is one of: a message from a peer, a clock tick, a client proposal, a read request (milestone 4), or a confirmation that earlier state reached disk. `Output` is one of: send a message, persist entries or hard state, apply committed entries, answer a client.
+`Input` is one of: a message from a peer, a clock tick, a client proposal, a read request, or a confirmation that earlier state reached disk. `Output` is one of: send a message, persist entries or hard state, apply committed entries, answer a client.
 
 The core has no threads, no sockets, no files, no `Instant::now()` and no global randomness. Election timeouts come from a seeded generator passed in at construction. See [ADR 0001](adr/0001-sans-io-core-and-own-simulator.md).
 
@@ -67,7 +67,9 @@ Sessions do not expire yet, so the table only grows.
 
 ### Reads
 
-Until ReadIndex arrives in milestone 4, a read is a log entry like any other operation.
+A read does not go through the log. The leader notes its commit index, has a quorum confirm that it still leads, and the node then answers from its state machine once that has applied the index (ReadIndex). No clock is involved. A leader that has not committed an entry of its own term yet, or that steps down while a read waits, refuses the read and the client tries again. See [ADR 0004](adr/0004-reads-by-read-index-no-leases.md).
+
+A get can still be sent through the log like any other operation; the simulator does both.
 
 ### Transport and wire format
 
@@ -89,7 +91,8 @@ Faults:
 - Slow disks: a write completes some ticks after it was requested, in request order.
 - Clients: requests and replies are lost, a client that waits too long sends the same request to another node, and old requests are sent again at random.
 - Bytes that are not a request are proposed, to check that every node ignores them the same way.
-- Clock skew between nodes, within a configured bound (not built yet).
+- Clock drift: now and then a node ticks only half or a fifth of the time, and a leader that is cut off often slows to a tenth.
+- Power cuts are aimed at a leader half the time.
 
 Checks, after every step:
 
@@ -119,7 +122,7 @@ A simulator that never fails proves nothing. The test suite includes known-wrong
 - Grant a vote without checking that the candidate's log is up to date.
 - Acknowledge an append before it is durable.
 - Carry out a retried request a second time.
-- Answer a read from a leader that has not confirmed its leadership (milestone 4).
+- Answer a read from a leader that has not confirmed its leadership.
 
 ## Errors
 

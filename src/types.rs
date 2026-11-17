@@ -151,6 +151,24 @@ impl PersistSeq {
     }
 }
 
+/// Identifies one read request on one node. The driver chooses it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ReadId(u64);
+
+impl ReadId {
+    /// Wraps a raw read id.
+    #[must_use]
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// The raw read id.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// A change to the stored log: drop everything at or after `first_index`, then store `entries`
 /// starting there.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,6 +263,22 @@ pub enum AppendOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Message {
+    /// A node asks whether it would get a vote for `term`, without being in that term yet.
+    PreVote {
+        /// The term the node would start an election for: its own plus one.
+        term: Term,
+        /// Index of the node's last log entry.
+        last_log_index: Index,
+        /// Term of the node's last log entry.
+        last_log_term: Term,
+    },
+    /// The answer to `PreVote`.
+    PreVoteResponse {
+        /// The term that was asked about if `granted`, otherwise the responder's own term.
+        term: Term,
+        /// Whether the responder would vote for the node.
+        granted: bool,
+    },
     /// A candidate asks for a vote.
     RequestVote {
         /// The candidate's term.
@@ -273,6 +307,9 @@ pub enum Message {
         entries: Vec<Entry>,
         /// The leader's commit index.
         leader_commit: Index,
+        /// The leader's read round, to be repeated in the answer. It lets the leader tell that an
+        /// answer belongs to a message it sent after a given read arrived.
+        round: u64,
     },
     /// The answer to `AppendEntries`.
     AppendEntriesResponse {
@@ -280,15 +317,20 @@ pub enum Message {
         term: Term,
         /// Whether the entries were stored.
         outcome: AppendOutcome,
+        /// The round of the request being answered.
+        round: u64,
     },
 }
 
 impl Message {
-    /// The sender's term, which every message carries.
+    /// The term the message carries. For a pre-vote and a granted answer to one, that is a term
+    /// the sender is asking about, not one it is in.
     #[must_use]
     pub const fn term(&self) -> Term {
         match self {
-            Self::RequestVote { term, .. }
+            Self::PreVote { term, .. }
+            | Self::PreVoteResponse { term, .. }
+            | Self::RequestVote { term, .. }
             | Self::RequestVoteResponse { term, .. }
             | Self::AppendEntries { term, .. }
             | Self::AppendEntriesResponse { term, .. } => *term,
@@ -311,6 +353,12 @@ pub enum Input {
     },
     /// A client wants this command replicated.
     Propose(Vec<u8>),
+    /// A client wants to read. The node answers with [`Output::ReadReady`] or
+    /// [`Output::ReadRejected`] for the same id.
+    Read {
+        /// Chosen by the driver, to match the answer to the read.
+        id: ReadId,
+    },
     /// The [`Persist`] request with this number, and every earlier one, is on stable storage.
     Persisted {
         /// The sequence number of the request that completed.
@@ -339,6 +387,22 @@ pub enum Output {
         index: Index,
         /// The committed entry.
         entry: Entry,
+    },
+    /// The read may be served from the state machine as soon as it has applied `index`. The
+    /// result is linearizable.
+    ReadReady {
+        /// The read this answers.
+        id: ReadId,
+        /// The state machine must have applied at least this index before it answers.
+        index: Index,
+    },
+    /// The read cannot be served here: this node is not the leader, stopped being it while the
+    /// read waited, or has only just become it. The client should try again.
+    ReadRejected {
+        /// The read this answers.
+        id: ReadId,
+        /// The leader this node last heard from, if any.
+        leader: Option<NodeId>,
     },
     /// A proposal was refused because this node is not the leader.
     NotLeader {

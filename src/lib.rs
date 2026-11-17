@@ -54,5 +54,5 @@ pub use state::{Outcome, StateMachine};
 pub use storage::{Recovered, Storage, StorageError};
 pub use types::{
     AppendOutcome, Entry, HardState, Index, Input, LogWrite, Message, NodeId, Output, Payload,
-    Persist, PersistSeq, Term,
+    Persist, PersistSeq, ReadId, Term,
 };

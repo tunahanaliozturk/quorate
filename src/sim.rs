@@ -9,11 +9,14 @@
 //! - Messages are dropped, duplicated and delayed, which also reorders them.
 //! - The network is partitioned in several shapes.
 //! - Disks are slow: a write completes some ticks after it was requested.
+//! - Clocks drift: now and then a node starts ticking only half or a fifth of the time, and a
+//!   leader that gets cut off often slows to a tenth.
 //! - Nodes lose power. A node that goes down forgets everything in memory and every write that
 //!   had not completed. Its log and its state machine are katman databases on katman's simulated
 //!   filesystem, which drops unsynced bytes on a power cut. It restarts later from what they hold.
 //! - Clients lose requests and replies, give up waiting and send the same request to another
-//!   node, and now and then send an old request again.
+//!   node, and now and then send an old request again. Most gets are served by the leader
+//!   without a log entry; the rest go through the log.
 //!
 //! Checked after every step: election safety, state machine safety, leader completeness, and that
 //! no node applies an entry before its own disk has it.
@@ -34,7 +37,7 @@ use crate::raft::{Bug, Raft, Role};
 use crate::rng::Rng;
 use crate::state::{Outcome, StateMachine};
 use crate::storage::{Recovered, Storage};
-use crate::types::{Entry, Index, Input, Message, NodeId, Output, Persist, Term};
+use crate::types::{Entry, Index, Input, Message, NodeId, Output, Persist, ReadId, Term};
 
 /// Keys the clients work on. Few, so that their operations collide.
 const KEYS: usize = 2;
@@ -90,6 +93,8 @@ struct Live {
     state: StateMachine,
     /// Writes the disk has not finished, with the tick at which each completes.
     disk: VecDeque<(u64, Persist)>,
+    /// Reads the node may serve once its state machine has applied the given index.
+    parked: Vec<(Index, ReadId)>,
 }
 
 struct Node {
@@ -99,6 +104,10 @@ struct Node {
     /// `None` while the node is down.
     live: Option<Live>,
     restart_at: u64,
+    /// How fast the node's clock runs: the chance, in percent, that it ticks when real time
+    /// does. Timeouts are the only thing a node uses its clock for, so a slow clock makes it
+    /// slow to notice that it has been cut off.
+    clock_percent: u64,
     /// How many times the node has started. A client that was waiting on an earlier life of the
     /// node gets no answer from a later one.
     life: u64,
@@ -113,6 +122,8 @@ struct Waiting {
     /// The node the request went to, and which life of it.
     target: Option<(usize, u64)>,
     sent_at: u64,
+    /// For a get that does not go through the log: the id of the read last sent.
+    read: Option<ReadId>,
 }
 
 struct Client {
@@ -143,6 +154,7 @@ pub(crate) struct Sim {
     /// Every entry any node has applied, by position.
     committed: Vec<Entry>,
     next_command: u64,
+    next_read: u64,
     clients: Vec<Client>,
     /// Whether clients start new operations and lose requests and replies.
     clients_busy: bool,
@@ -207,6 +219,7 @@ impl Sim {
                     fs: SimFs::new(),
                     live: None,
                     restart_at: 0,
+                    clock_percent: 100,
                     life: 0,
                 }
             })
@@ -234,6 +247,7 @@ impl Sim {
             leaders: HashMap::new(),
             committed: Vec::new(),
             next_command: 0,
+            next_read: 0,
             clients,
             clients_busy: true,
             histories: vec![Vec::new(); KEYS],
@@ -253,8 +267,19 @@ impl Sim {
             if self.chance(3) {
                 self.change_partition();
             }
-            if self.rng.below(1000) < self.crash_per_mille {
+            if self.chance(1) {
                 let node = self.pick(self.nodes.len());
+                self.nodes[node].clock_percent = [100, 100, 50, 20][to_usize(self.rng.below(4))];
+            }
+            if self.rng.below(1000) < self.crash_per_mille {
+                // Half the time the victim is a leader. A leader that dies soon after it was
+                // elected leaves entries behind that only it holds, which is where the hard
+                // cases for the commit rule start.
+                let leader = self.leaders().first().copied();
+                let node = match leader {
+                    Some(leader) if self.chance(50) => leader,
+                    _ => self.pick(self.nodes.len()),
+                };
                 self.crash(node);
             }
             self.advance()?;
@@ -324,6 +349,7 @@ impl Sim {
             storage,
             state,
             disk: VecDeque::new(),
+            parked: Vec::new(),
         });
     }
 
@@ -366,7 +392,9 @@ impl Sim {
             self.step(envelope.to, input)?;
         }
         for node in 0..self.nodes.len() {
-            self.step(node, Input::Tick)?;
+            if self.chance(self.nodes[node].clock_percent) {
+                self.step(node, Input::Tick)?;
+            }
         }
         for client in 0..self.clients.len() {
             self.act(client)?;
@@ -417,9 +445,16 @@ impl Sim {
                 Output::Persist(persist) => finished = self.start_write(node, persist),
                 Output::Send { to, message } => self.send(node, position_of(to), &message),
                 Output::Apply { index, entry } => self.apply(node, index, entry)?,
+                Output::ReadReady { id, index } => {
+                    if let Some(live) = self.nodes[node].live.as_mut() {
+                        live.parked.push((index, id));
+                    }
+                }
+                Output::ReadRejected { id, .. } => self.read_rejected(id),
                 Output::NotLeader { .. } => {}
             }
         }
+        self.serve_reads(node);
         self.check_leader(node)?;
         // Only now, after everything this step asked for is done. Telling the node earlier would
         // run a second step inside the first and apply later entries before earlier ones.
@@ -552,6 +587,8 @@ impl Sim {
         });
 
         let slot = self.histories[key].len() - 1;
+        // Most gets take the read path; the rest go through the log like any other operation.
+        let read = (call == Call::Get && self.chance(80)).then_some(ReadId::new(0));
         let client = &mut self.clients[client];
         client.seq += 1;
         let request = Request::new(client.session, client.seq, op).encode();
@@ -561,6 +598,7 @@ impl Sim {
             slot,
             target: None,
             sent_at: self.now,
+            read,
         });
     }
 
@@ -575,16 +613,82 @@ impl Sim {
         };
         let lost = self.clients_busy && self.chance(10);
         let life = self.nodes[node].life;
+        self.next_read += 1;
+        let id = ReadId::new(self.next_read);
         let Some(waiting) = self.clients[client].waiting.as_mut() else {
             return Ok(());
         };
         waiting.target = Some((node, life));
         waiting.sent_at = self.now;
+        let input = if waiting.read.is_some() {
+            // A fresh id each time, so an answer to an earlier attempt is not taken for this one.
+            waiting.read = Some(id);
+            Input::Read { id }
+        } else {
+            Input::Propose(waiting.request.clone())
+        };
         if lost {
             return Ok(());
         }
-        let request = waiting.request.clone();
-        self.step(node, Input::Propose(request))
+        self.step(node, input)
+    }
+
+    /// Serves the reads a node has been cleared to answer and whose index it has applied.
+    fn serve_reads(&mut self, node: usize) {
+        let Some(live) = self.nodes[node].live.as_mut() else {
+            return;
+        };
+        let applied = live.state.applied_index();
+        let (due, parked) = core::mem::take(&mut live.parked)
+            .into_iter()
+            .partition(|(index, _)| *index <= applied);
+        live.parked = parked;
+        let due: Vec<(Index, ReadId)> = due;
+        for (_, id) in due {
+            self.answer_read(node, id);
+        }
+    }
+
+    /// A node answers a read from its state machine, if the client is still waiting on this node
+    /// for this read. The answer may be lost on the way.
+    fn answer_read(&mut self, node: usize, id: ReadId) {
+        let lost = self.clients_busy && self.chance(10);
+        let life = self.nodes[node].life;
+        let Some(running) = self.nodes[node].live.as_ref() else {
+            return;
+        };
+        let expected =
+            |waiting: &Waiting| waiting.read == Some(id) && waiting.target == Some((node, life));
+        let Some(client) = self
+            .clients
+            .iter_mut()
+            .find(|client| client.waiting.as_ref().is_some_and(expected))
+        else {
+            return;
+        };
+        if lost {
+            return;
+        }
+        if let Some(waiting) = client.waiting.take() {
+            let value = running
+                .state
+                .get(&key_bytes(waiting.key))
+                .expect("the simulated disk does not fail");
+            self.events += 1;
+            let result = Return::Value(value.as_deref().map(value_of));
+            self.histories[waiting.key][waiting.slot].returned = Some((self.events, result));
+        }
+    }
+
+    /// A node refused a read. The client tries again on its next turn, likely elsewhere.
+    fn read_rejected(&mut self, id: ReadId) {
+        let waiting = self
+            .clients
+            .iter_mut()
+            .filter_map(|client| client.waiting.as_mut());
+        if let Some(waiting) = waiting.into_iter().find(|waiting| waiting.read == Some(id)) {
+            waiting.target = None;
+        }
     }
 
     /// A node applied a request and answers the client, if the client is still waiting on this
@@ -641,6 +745,11 @@ impl Sim {
                 for other in (0..size).filter(|&other| other != isolated) {
                     self.blocked[isolated][other] = true;
                     self.blocked[other][isolated] = true;
+                }
+                // Often its clock is slow as well, so it takes long to notice. This is the node
+                // that would serve stale reads if it trusted itself.
+                if self.chance(50) {
+                    self.nodes[isolated].clock_percent = 10;
                 }
             }
             // One direction of one link.
@@ -781,6 +890,7 @@ impl Sim {
         self.clients_busy = false;
         for node in &mut self.nodes {
             node.restart_at = 0;
+            node.clock_percent = 100;
         }
 
         // A follower that fell behind catches up one batch per round trip, and the smallest batch
@@ -921,6 +1031,15 @@ mod tests {
     #[test]
     fn carrying_out_a_retried_request_twice_is_caught() {
         let found = first_safety_violation(Bug::ApplyRetriesAgain, 1_000);
+        assert!(
+            matches!(found, Some((_, Violation::NotLinearizable { .. }))),
+            "expected a history that is not linearizable, got {found:?}"
+        );
+    }
+
+    #[test]
+    fn answering_a_read_without_confirming_leadership_is_caught() {
+        let found = first_safety_violation(Bug::ReadWithoutQuorum, 1_000);
         assert!(
             matches!(found, Some((_, Violation::NotLinearizable { .. }))),
             "expected a history that is not linearizable, got {found:?}"

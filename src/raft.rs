@@ -13,6 +13,13 @@
 //! [`Input::Persisted`]. A vote is not sent before it is on disk, and an append is not
 //! acknowledged before the entries are. A leader counts its own log towards a quorum only up to
 //! its durable index, and no node applies an entry it has not stored durably.
+//!
+//! # Staying out of the way
+//!
+//! Two rules keep a node with a bad connection from disturbing a healthy cluster. Before an
+//! election a node asks whether it could win (pre-vote); asking changes nothing, so a node that
+//! was cut off returns with the term it left with. And a leader that hears from fewer than a
+//! quorum for a whole election timeout steps down (check-quorum).
 
 use std::collections::VecDeque;
 
@@ -21,7 +28,7 @@ use crate::log::Log;
 use crate::rng::Rng;
 use crate::types::{
     AppendOutcome, Entry, HardState, Index, Input, LogWrite, Message, NodeId, Output, Payload,
-    Persist, PersistSeq, Term,
+    Persist, PersistSeq, ReadId, Term,
 };
 
 /// What a node currently is.
@@ -30,6 +37,8 @@ use crate::types::{
 pub enum Role {
     /// Accepts entries from a leader.
     Follower,
+    /// Asking whether an election could be won, without starting one.
+    PreCandidate,
     /// Asking for votes.
     Candidate,
     /// Replicating its log to the others.
@@ -48,6 +57,11 @@ pub(crate) enum Bug {
     VoteWithoutLogCheck,
     /// Send messages without waiting for the state they depend on to be durable.
     SendBeforeDurable,
+    /// Answer a read without asking a quorum whether this node still leads.
+    ReadWithoutQuorum,
+    /// Start an election without asking first. Not a safety bug; used to show what pre-vote
+    /// prevents.
+    SkipPreVote,
 }
 
 /// What the leader knows about one follower.
@@ -58,6 +72,20 @@ struct Progress {
     next: Index,
     /// The last entry known to be stored on the follower.
     matched: Index,
+    /// The highest read round the follower has answered.
+    acked_round: u64,
+    /// Whether the follower has answered anything since the last quorum check.
+    active: bool,
+}
+
+/// A read waiting for a quorum to confirm that this node still leads.
+#[derive(Debug)]
+struct PendingRead {
+    id: ReadId,
+    /// The commit index when the read arrived. Any state that includes it may answer the read.
+    index: Index,
+    /// Followers that answer a message of this round or a later one confirm the read.
+    round: u64,
 }
 
 #[derive(Debug)]
@@ -65,12 +93,19 @@ enum State {
     Follower {
         leader: Option<NodeId>,
     },
+    PreCandidate {
+        votes: Vec<NodeId>,
+    },
     Candidate {
         votes: Vec<NodeId>,
     },
     Leader {
         progress: Vec<Progress>,
         since_heartbeat: u32,
+        since_quorum_check: u32,
+        /// Counts the reads accepted in this term. Every `AppendEntries` carries it.
+        round: u64,
+        reads: VecDeque<PendingRead>,
     },
 }
 
@@ -183,6 +218,7 @@ impl Raft {
             Input::Tick => self.tick(&mut produced),
             Input::Message { from, message } => self.receive(from, message, &mut produced),
             Input::Propose(command) => self.propose(command, &mut produced),
+            Input::Read { id } => self.read(id, &mut produced),
             Input::Persisted { seq } => self.on_persisted(seq, &mut out),
         }
         if let Some(persist) = self.take_persist() {
@@ -210,6 +246,7 @@ impl Raft {
     pub const fn role(&self) -> Role {
         match self.state {
             State::Follower { .. } => Role::Follower,
+            State::PreCandidate { .. } => Role::PreCandidate,
             State::Candidate { .. } => Role::Candidate,
             State::Leader { .. } => Role::Leader,
         }
@@ -220,7 +257,7 @@ impl Raft {
     pub const fn leader(&self) -> Option<NodeId> {
         match self.state {
             State::Follower { leader } => leader,
-            State::Candidate { .. } => None,
+            State::PreCandidate { .. } | State::Candidate { .. } => None,
             State::Leader { .. } => Some(self.id),
         }
     }
@@ -361,20 +398,46 @@ impl Raft {
     // ---- Time and clients. ----
 
     fn tick(&mut self, out: &mut Vec<Output>) {
-        if let State::Leader {
-            since_heartbeat, ..
-        } = &mut self.state
-        {
-            *since_heartbeat += 1;
-            if *since_heartbeat >= self.heartbeat_ticks {
-                *since_heartbeat = 0;
-                self.broadcast_append(out);
-            }
+        if matches!(self.state, State::Leader { .. }) {
+            self.leader_tick(out);
             return;
         }
         self.elapsed = self.elapsed.saturating_add(1);
         if self.elapsed >= self.timeout {
-            self.campaign(out);
+            self.pre_campaign(out);
+        }
+    }
+
+    fn leader_tick(&mut self, out: &mut Vec<Output>) {
+        let quorum = self.quorum();
+        let State::Leader {
+            progress,
+            since_heartbeat,
+            since_quorum_check,
+            ..
+        } = &mut self.state
+        else {
+            return;
+        };
+        // Check-quorum: a leader that has heard from fewer than a quorum for a whole election
+        // timeout is cut off. Its followers have given up on it or soon will, so it stops
+        // accepting work it could never commit.
+        *since_quorum_check += 1;
+        if *since_quorum_check >= self.election_ticks {
+            *since_quorum_check = 0;
+            let heard_from = 1 + progress.iter().filter(|follower| follower.active).count();
+            for follower in progress.iter_mut() {
+                follower.active = false;
+            }
+            if heard_from < quorum {
+                self.become_follower(self.term, None, out);
+                return;
+            }
+        }
+        *since_heartbeat += 1;
+        if *since_heartbeat >= self.heartbeat_ticks {
+            *since_heartbeat = 0;
+            self.broadcast_append(out);
         }
     }
 
@@ -389,7 +452,101 @@ impl Raft {
         self.broadcast_append(out);
     }
 
+    /// A linearizable read without a log entry (`ReadIndex`, Raft thesis 6.4).
+    ///
+    /// The read may be served from any state that includes the commit index of this moment,
+    /// provided this node really is the leader at this moment. It cannot know that by itself: a
+    /// newer leader may exist that it has not heard of. So it asks. Followers that answer a
+    /// message sent after the read arrived confirm that no newer term had reached them by then,
+    /// and a quorum of them leaves no room for a newer leader.
+    fn read(&mut self, id: ReadId, out: &mut Vec<Output>) {
+        let index = self.commit;
+        // Until an entry of its own term is committed, a new leader does not know how far the
+        // previous leaders got, so its commit index may be behind.
+        let knows_commit = self.log.term_at(index) == Some(self.term);
+        let leader = self.leader();
+        let quorum = self.quorum();
+        let State::Leader { round, reads, .. } = &mut self.state else {
+            out.push(Output::ReadRejected { id, leader });
+            return;
+        };
+        if !knows_commit {
+            out.push(Output::ReadRejected { id, leader });
+            return;
+        }
+        let alone = quorum == 1;
+        #[cfg(test)]
+        let alone = alone || self.bug == Some(Bug::ReadWithoutQuorum);
+
+        if alone {
+            out.push(Output::ReadReady { id, index });
+            return;
+        }
+        *round += 1;
+        reads.push_back(PendingRead {
+            id,
+            index,
+            round: *round,
+        });
+        self.broadcast_append(out);
+    }
+
+    /// Releases the reads that a quorum has confirmed.
+    fn confirm_reads(&mut self, out: &mut Vec<Output>) {
+        let quorum = self.quorum();
+        let State::Leader {
+            progress, reads, ..
+        } = &mut self.state
+        else {
+            return;
+        };
+        while let Some(read) = reads.front() {
+            let confirmed = 1 + progress
+                .iter()
+                .filter(|follower| follower.acked_round >= read.round)
+                .count();
+            if confirmed < quorum {
+                break;
+            }
+            out.push(Output::ReadReady {
+                id: read.id,
+                index: read.index,
+            });
+            reads.pop_front();
+        }
+    }
+
     // ---- Elections. ----
+
+    /// Asks whether an election could be won, without disturbing anyone (pre-vote, Raft thesis
+    /// 9.6). Nothing changes on this node or on the ones it asks. A node cut off from the
+    /// cluster therefore keeps its term, and when it comes back it does not force the leader
+    /// out with a term nobody else has seen.
+    fn pre_campaign(&mut self, out: &mut Vec<Output>) {
+        self.reset_timer();
+        let direct = self.quorum() == 1;
+        #[cfg(test)]
+        let direct = direct || self.bug == Some(Bug::SkipPreVote);
+
+        if direct {
+            self.campaign(out);
+            return;
+        }
+        self.state = State::PreCandidate {
+            votes: vec![self.id],
+        };
+        let message = Message::PreVote {
+            term: self.term.next(),
+            last_log_index: self.log.last_index(),
+            last_log_term: self.log.last_term(),
+        };
+        for &peer in &self.peers {
+            out.push(Output::Send {
+                to: peer,
+                message: message.clone(),
+            });
+        }
+    }
 
     /// Starts an election for the next term.
     fn campaign(&mut self, out: &mut Vec<Output>) {
@@ -425,11 +582,16 @@ impl Raft {
                 peer,
                 next,
                 matched: Index::ZERO,
+                acked_round: 0,
+                active: false,
             })
             .collect();
         self.state = State::Leader {
             progress,
             since_heartbeat: 0,
+            since_quorum_check: 0,
+            round: 0,
+            reads: VecDeque::new(),
         };
         // A leader may only commit by counting replicas of an entry from its own term. Without
         // this entry, earlier entries would wait for the next client command.
@@ -437,24 +599,49 @@ impl Raft {
         self.broadcast_append(out);
     }
 
-    /// Steps down, adopting `term` if it is newer.
-    fn become_follower(&mut self, term: Term, leader: Option<NodeId>) {
+    /// Steps down, adopting `term` if it is newer. Reads a leader was still confirming are
+    /// refused: it can no longer vouch for them.
+    fn become_follower(&mut self, term: Term, leader: Option<NodeId>, out: &mut Vec<Output>) {
         if term > self.term {
             self.set_term(term);
         }
-        let was_follower = matches!(self.state, State::Follower { .. });
-        self.state = State::Follower { leader };
-        if !was_follower {
-            // A leader has no running election timer, and a candidate's was for its own election.
-            self.reset_timer();
+        match core::mem::replace(&mut self.state, State::Follower { leader }) {
+            State::Follower { .. } => {}
+            State::Leader { reads, .. } => {
+                out.extend(reads.into_iter().map(|read| Output::ReadRejected {
+                    id: read.id,
+                    leader,
+                }));
+                // A leader has no running election timer.
+                self.reset_timer();
+            }
+            // The timer was running for this node's own election.
+            State::PreCandidate { .. } | State::Candidate { .. } => self.reset_timer(),
         }
     }
 
     fn receive(&mut self, from: NodeId, message: Message, out: &mut Vec<Output>) {
-        if message.term() > self.term {
-            self.become_follower(message.term(), None);
+        // A pre-vote asks about a term nobody is in yet, and a granted pre-vote repeats that
+        // term back. Neither is evidence that the term exists.
+        let names_a_real_term = match message {
+            Message::PreVote { .. } => false,
+            Message::PreVoteResponse { granted, .. } => !granted,
+            _ => true,
+        };
+        if names_a_real_term && message.term() > self.term {
+            self.become_follower(message.term(), None, out);
         }
         match message {
+            Message::PreVote {
+                term,
+                last_log_index,
+                last_log_term,
+            } => {
+                self.on_pre_vote(from, term, last_log_index, last_log_term, out);
+            }
+            Message::PreVoteResponse { term, granted } => {
+                self.on_pre_vote_response(from, term, granted, out);
+            }
             Message::RequestVote {
                 term,
                 last_log_index,
@@ -471,6 +658,7 @@ impl Raft {
                 prev_log_term,
                 entries,
                 leader_commit,
+                round,
             } => {
                 let outcome = self.on_append(
                     from,
@@ -479,16 +667,84 @@ impl Raft {
                     prev_log_term,
                     entries,
                     leader_commit,
+                    out,
                 );
                 let message = Message::AppendEntriesResponse {
                     term: self.term,
                     outcome,
+                    round,
                 };
                 out.push(Output::Send { to: from, message });
             }
-            Message::AppendEntriesResponse { term, outcome } => {
-                self.on_append_response(from, term, outcome, out);
+            Message::AppendEntriesResponse {
+                term,
+                outcome,
+                round,
+            } => {
+                self.on_append_response(from, term, outcome, round, out);
             }
+        }
+    }
+
+    /// Raft §5.4.1: only vote for a candidate whose log is at least as complete as ours. This is
+    /// what guarantees that a new leader holds every committed entry.
+    fn log_is_up_to_date(&self, last_log_index: Index, last_log_term: Term) -> bool {
+        let up_to_date =
+            (last_log_term, last_log_index) >= (self.log.last_term(), self.log.last_index());
+        #[cfg(test)]
+        let up_to_date = up_to_date || self.bug == Some(Bug::VoteWithoutLogCheck);
+
+        up_to_date
+    }
+
+    fn on_pre_vote(
+        &mut self,
+        from: NodeId,
+        term: Term,
+        last_log_index: Index,
+        last_log_term: Term,
+        out: &mut Vec<Output>,
+    ) {
+        // A node that still hears from a leader says no. Otherwise a node that can send but not
+        // receive would collect pre-votes and then depose a healthy leader.
+        let has_a_leader = match self.state {
+            State::Leader { .. } => true,
+            State::Follower { leader: Some(_) } => self.elapsed < self.election_ticks,
+            State::Follower { leader: None }
+            | State::PreCandidate { .. }
+            | State::Candidate { .. } => false,
+        };
+        let granted = term > self.term
+            && !has_a_leader
+            && self.log_is_up_to_date(last_log_index, last_log_term);
+        // A grant repeats the term that was asked about, so the asker can match it to its
+        // question. A refusal carries this node's own term, in case the asker is behind.
+        let term = if granted { term } else { self.term };
+        out.push(Output::Send {
+            to: from,
+            message: Message::PreVoteResponse { term, granted },
+        });
+    }
+
+    fn on_pre_vote_response(
+        &mut self,
+        from: NodeId,
+        term: Term,
+        granted: bool,
+        out: &mut Vec<Output>,
+    ) {
+        if !granted || term != self.term.next() {
+            return;
+        }
+        let quorum = self.quorum();
+        let State::PreCandidate { votes } = &mut self.state else {
+            return;
+        };
+        if !votes.contains(&from) {
+            votes.push(from);
+        }
+        if votes.len() >= quorum {
+            self.campaign(out);
         }
     }
 
@@ -500,15 +756,10 @@ impl Raft {
         last_log_term: Term,
         out: &mut Vec<Output>,
     ) {
-        // Raft §5.4.1: only vote for a candidate whose log is at least as complete as ours. This
-        // is what guarantees that a new leader holds every committed entry.
-        let up_to_date =
-            (last_log_term, last_log_index) >= (self.log.last_term(), self.log.last_index());
-        #[cfg(test)]
-        let up_to_date = up_to_date || self.bug == Some(Bug::VoteWithoutLogCheck);
-
         let free_to_vote = self.voted_for.is_none_or(|candidate| candidate == from);
-        let granted = term == self.term && free_to_vote && up_to_date;
+        let granted = term == self.term
+            && free_to_vote
+            && self.log_is_up_to_date(last_log_index, last_log_term);
         if granted {
             self.set_vote(from);
             self.reset_timer();
@@ -538,6 +789,10 @@ impl Raft {
 
     // ---- Replication. ----
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the fields of one message, taken apart by the caller"
+    )]
     fn on_append(
         &mut self,
         from: NodeId,
@@ -546,6 +801,7 @@ impl Raft {
         prev_log_term: Term,
         entries: Vec<Entry>,
         leader_commit: Index,
+        out: &mut Vec<Output>,
     ) -> AppendOutcome {
         let rejected = |log: &Log| AppendOutcome::Rejected {
             prev_log_index,
@@ -559,7 +815,7 @@ impl Raft {
             // From a deposed leader. The term in our answer makes it step down.
             return rejected(&self.log);
         }
-        self.become_follower(term, Some(from));
+        self.become_follower(term, Some(from), out);
         self.reset_timer();
         if self.log.term_at(prev_log_index) != Some(prev_log_term) {
             return rejected(&self.log);
@@ -594,6 +850,7 @@ impl Raft {
         from: NodeId,
         term: Term,
         outcome: AppendOutcome,
+        round: u64,
         out: &mut Vec<Output>,
     ) {
         if term != self.term {
@@ -606,22 +863,29 @@ impl Raft {
         let Some(follower) = progress.iter_mut().find(|progress| progress.peer == from) else {
             return;
         };
+        // Any answer in this term, late or duplicated or a refusal, shows that the follower was
+        // still following when it answered the message of that round.
+        follower.active = true;
+        follower.acked_round = follower.acked_round.max(round);
+
         let send_more = match outcome {
+            // A late or duplicated answer brings nothing new.
+            AppendOutcome::Accepted { match_index } if match_index <= follower.matched => false,
             AppendOutcome::Accepted { match_index } => {
-                if match_index <= follower.matched {
-                    return; // A late or duplicated answer; nothing new.
-                }
                 follower.matched = match_index;
                 follower.next = follower.next.max(match_index.next());
                 follower.next <= last
+            }
+            // An answer to a probe we have already moved on from.
+            AppendOutcome::Rejected { prev_log_index, .. }
+                if follower.next.prev() != prev_log_index =>
+            {
+                false
             }
             AppendOutcome::Rejected {
                 prev_log_index,
                 retry_from,
             } => {
-                if follower.next.prev() != prev_log_index {
-                    return; // An answer to a probe we have already moved on from.
-                }
                 let retry = prev_log_index.min(retry_from).max(follower.matched.next());
                 // Probe again at once only if this moved us back. A follower that refuses an
                 // index it has acknowledged has lost data, and answering each refusal with the
@@ -634,6 +898,7 @@ impl Raft {
         };
         let next = follower.next;
         self.advance_commit();
+        self.confirm_reads(out);
         if send_more {
             out.push(Output::Send {
                 to: from,
@@ -645,12 +910,17 @@ impl Raft {
     /// The `AppendEntries` message for a follower whose next entry is `next`.
     fn append_from(&self, next: Index) -> Message {
         let prev_log_index = next.prev();
+        let round = match self.state {
+            State::Leader { round, .. } => round,
+            _ => 0,
+        };
         Message::AppendEntries {
             term: self.term,
             prev_log_index,
             prev_log_term: self.log.term_at(prev_log_index).unwrap_or_default(),
             entries: self.log.slice_from(next, self.max_batch),
             leader_commit: self.commit,
+            round,
         }
     }
 
@@ -713,9 +983,11 @@ impl Raft {
 
 #[cfg(test)]
 mod tests {
-    use super::{Raft, Role};
+    use std::collections::VecDeque;
+
+    use super::{Bug, Raft, Role};
     use crate::Config;
-    use crate::types::{Index, Input, Message, NodeId, Output, Term};
+    use crate::types::{Index, Input, Message, NodeId, Output, ReadId, Term};
 
     #[test]
     fn a_single_node_commits_nothing_until_its_own_write_is_durable() {
@@ -808,5 +1080,256 @@ mod tests {
                 message: granted
             }]
         );
+    }
+
+    /// A cluster with an instant network and instant disks, for tests that are about one rule
+    /// and need no faults. A node that is cut off neither sends nor receives.
+    struct Cluster {
+        nodes: Vec<Raft>,
+        cut_off: Vec<bool>,
+        /// Links that lose every message, as (from, to).
+        broken: Vec<(usize, usize)>,
+        ready: Vec<ReadId>,
+        rejected: Vec<ReadId>,
+    }
+
+    impl Cluster {
+        fn new(size: u64, bug: Option<Bug>) -> Self {
+            let nodes: Vec<Raft> = (1..=size)
+                .map(|id| {
+                    let peers = (1..=size).filter(|&peer| peer != id).map(NodeId::new);
+                    let config = Config::new(NodeId::new(id), peers, id);
+                    let mut node = Raft::new(config).expect("a valid configuration");
+                    if let Some(bug) = bug {
+                        node.inject(bug);
+                    }
+                    node
+                })
+                .collect();
+            let cut_off = vec![false; nodes.len()];
+            Self {
+                nodes,
+                cut_off,
+                broken: Vec::new(),
+                ready: Vec::new(),
+                rejected: Vec::new(),
+            }
+        }
+
+        fn position(&self, id: NodeId) -> usize {
+            self.nodes
+                .iter()
+                .position(|node| node.id() == id)
+                .expect("a node of this cluster")
+        }
+
+        /// Feeds one input and everything that follows from it, until the cluster is still.
+        fn feed(&mut self, node: usize, input: Input) {
+            let mut queue = VecDeque::from([(node, input)]);
+            while let Some((node, input)) = queue.pop_front() {
+                let from = self.nodes[node].id();
+                for output in self.nodes[node].step(input) {
+                    match output {
+                        Output::Persist(request) => {
+                            queue.push_front((node, Input::Persisted { seq: request.seq() }));
+                        }
+                        Output::Send { to, message } => {
+                            let to = self.position(to);
+                            let broken = self.broken.contains(&(node, to));
+                            if !self.cut_off[node] && !self.cut_off[to] && !broken {
+                                queue.push_back((to, Input::Message { from, message }));
+                            }
+                        }
+                        Output::ReadReady { id, .. } => self.ready.push(id),
+                        Output::ReadRejected { id, .. } => self.rejected.push(id),
+                        Output::Apply { .. } | Output::NotLeader { .. } => {}
+                    }
+                }
+            }
+        }
+
+        fn run(&mut self, ticks: u32) {
+            for _ in 0..ticks {
+                for node in 0..self.nodes.len() {
+                    self.feed(node, Input::Tick);
+                }
+            }
+        }
+
+        /// The leader with the highest term.
+        fn leader(&self) -> usize {
+            (0..self.nodes.len())
+                .filter(|&node| self.nodes[node].role() == Role::Leader)
+                .max_by_key(|&node| self.nodes[node].term())
+                .expect("the cluster has a leader")
+        }
+    }
+
+    #[test]
+    fn a_node_that_was_cut_off_does_not_force_an_election_when_it_returns() {
+        // The second run switches pre-vote off, to show that the first one passes because of it.
+        for (bug, disturbed) in [(None, false), (Some(Bug::SkipPreVote), true)] {
+            let mut cluster = Cluster::new(3, bug);
+            cluster.run(60);
+            let leader = cluster.leader();
+            let term = cluster.nodes[leader].term();
+
+            let outsider = (leader + 1) % 3;
+            cluster.cut_off[outsider] = true;
+            cluster.run(200);
+            cluster.cut_off[outsider] = false;
+            cluster.run(60);
+
+            let term_now = cluster.nodes[cluster.leader()].term();
+            assert_eq!(
+                term_now != term,
+                disturbed,
+                "with {bug:?} the term went from {term:?} to {term_now:?}"
+            );
+            if !disturbed {
+                assert_eq!(cluster.leader(), leader);
+                assert_eq!(cluster.nodes[outsider].term(), term);
+                assert_eq!(cluster.nodes[outsider].role(), Role::Follower);
+            }
+        }
+    }
+
+    /// The node hears everyone but the leader. It runs out of patience and asks for pre-votes,
+    /// and the other follower, which hears the leader fine, has to say no. If it said yes the
+    /// node would win an election the cluster did not need.
+    #[test]
+    fn a_node_that_cannot_hear_the_leader_does_not_depose_it() {
+        let mut cluster = Cluster::new(3, None);
+        cluster.run(60);
+        let leader = cluster.leader();
+        let term = cluster.nodes[leader].term();
+
+        cluster.broken.push((leader, (leader + 1) % 3));
+        cluster.run(200);
+
+        assert_eq!(cluster.leader(), leader);
+        assert_eq!(cluster.nodes[leader].term(), term);
+    }
+
+    #[test]
+    fn a_leader_that_loses_its_quorum_steps_down() {
+        let mut cluster = Cluster::new(3, None);
+        cluster.run(60);
+        let old = cluster.leader();
+        let term = cluster.nodes[old].term();
+
+        cluster.cut_off[old] = true;
+        // Two election timeouts at most: one check may still see answers from before the cut.
+        cluster.run(25);
+        assert_ne!(cluster.nodes[old].role(), Role::Leader);
+
+        cluster.run(60);
+        let new = cluster.leader();
+        assert_ne!(new, old);
+        assert!(cluster.nodes[new].term() > term);
+    }
+
+    #[test]
+    fn a_read_is_answered_only_once_a_quorum_confirms_the_leader() {
+        let mut cluster = Cluster::new(3, None);
+        cluster.run(60);
+        let leader = cluster.leader();
+
+        cluster.feed(leader, Input::Read { id: ReadId::new(1) });
+        assert_eq!(cluster.ready, [ReadId::new(1)]);
+
+        // A follower does not serve reads.
+        cluster.feed((leader + 1) % 3, Input::Read { id: ReadId::new(2) });
+        assert_eq!(cluster.rejected, [ReadId::new(2)]);
+
+        // Cut off, the leader cannot confirm anything. The read waits, and is refused when the
+        // leader gives up.
+        cluster.cut_off[leader] = true;
+        cluster.feed(leader, Input::Read { id: ReadId::new(3) });
+        assert_eq!(cluster.ready, [ReadId::new(1)]);
+        cluster.run(25);
+        assert_eq!(cluster.ready, [ReadId::new(1)]);
+        assert_eq!(cluster.rejected, [ReadId::new(2), ReadId::new(3)]);
+    }
+
+    /// What the rule above prevents: a leader that is cut off answers from state that the rest
+    /// of the cluster may already have moved past.
+    #[test]
+    fn without_the_quorum_round_a_cut_off_leader_answers_reads() {
+        let mut cluster = Cluster::new(3, Some(Bug::ReadWithoutQuorum));
+        cluster.run(60);
+        let leader = cluster.leader();
+        cluster.cut_off[leader] = true;
+        cluster.feed(leader, Input::Read { id: ReadId::new(1) });
+        assert_eq!(cluster.ready, [ReadId::new(1)]);
+    }
+
+    /// A new leader holds every committed entry, but its commit index can be behind: the old
+    /// leader may have committed entries without having told it yet. Until an entry of its own
+    /// term commits, it does not know where the log really ends, and a read answered from its
+    /// commit index could miss a write that was already acknowledged.
+    #[test]
+    fn a_new_leader_refuses_reads_until_it_has_committed_in_its_own_term() {
+        let peer = NodeId::new(2);
+        let config = Config::new(NodeId::new(1), [peer, NodeId::new(3)], 1);
+        let mut node = Raft::new(config).expect("a valid configuration");
+        let mut outputs = Vec::new();
+        // Feeds an input, and reports every write as durable at once.
+        let mut feed = |node: &mut Raft, input: Input| {
+            let mut inputs = VecDeque::from([input]);
+            while let Some(input) = inputs.pop_front() {
+                for output in node.step(input) {
+                    if let Output::Persist(request) = &output {
+                        inputs.push_back(Input::Persisted { seq: request.seq() });
+                    }
+                    outputs.push(output);
+                }
+            }
+        };
+
+        while node.role() == Role::Follower {
+            feed(&mut node, Input::Tick);
+        }
+        let granted = Message::PreVoteResponse {
+            term: Term::new(1),
+            granted: true,
+        };
+        feed(
+            &mut node,
+            Input::Message {
+                from: peer,
+                message: granted,
+            },
+        );
+        let granted = Message::RequestVoteResponse {
+            term: Term::new(1),
+            granted: true,
+        };
+        feed(
+            &mut node,
+            Input::Message {
+                from: peer,
+                message: granted,
+            },
+        );
+        assert_eq!(node.role(), Role::Leader);
+        // The no-op is in the log, and nobody has acknowledged it.
+        assert_eq!(node.commit_index(), Index::ZERO);
+
+        feed(&mut node, Input::Read { id: ReadId::new(1) });
+        let answers: Vec<&Output> = outputs
+            .iter()
+            .filter(|output| {
+                matches!(
+                    output,
+                    Output::ReadReady { .. } | Output::ReadRejected { .. }
+                )
+            })
+            .collect();
+        let refused = Output::ReadRejected {
+            id: ReadId::new(1),
+            leader: Some(NodeId::new(1)),
+        };
+        assert_eq!(answers, [&refused]);
     }
 }
