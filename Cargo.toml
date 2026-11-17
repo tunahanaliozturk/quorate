@@ -10,14 +10,16 @@ readme = "README.md"
 keywords = ["raft", "consensus", "distributed", "key-value", "simulation"]
 categories = ["database-implementations", "algorithms"]
 exclude = ["/.github", "/docs"]
+# Depends on katman by git revision, which crates.io does not accept.
+publish = false
 
 [dependencies]
 # Not on crates.io yet, so pinned to a commit. Move to a version once katman is published.
-katman = { git = "https://github.com/tunahanaliozturk/katman", rev = "dd90433d0273ef0d7d87e228813afdb1e0f10f01" }
+katman = { version = "0.0.0", git = "https://github.com/tunahanaliozturk/katman", rev = "dd90433d0273ef0d7d87e228813afdb1e0f10f01" }
 
 [dev-dependencies]
 # The simulator runs storage on katman's simulated filesystem.
-katman = { git = "https://github.com/tunahanaliozturk/katman", rev = "dd90433d0273ef0d7d87e228813afdb1e0f10f01", features = ["sim"] }
+katman = { version = "0.0.0", git = "https://github.com/tunahanaliozturk/katman", rev = "dd90433d0273ef0d7d87e228813afdb1e0f10f01", features = ["sim"] }
 
 [lints.rust]
 unsafe_code = "forbid"
