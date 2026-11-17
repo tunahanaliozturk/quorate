@@ -7,5 +7,8 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 - Repository scaffold, design document and roadmap.
 - Raft core as a pure state machine: leader election, log replication, a no-op entry on election and a conflict hint for fast log back-up. State is in memory only.
 - Durability: the core issues write requests and holds messages until they are reported durable. `Storage` keeps the term, vote and log in a katman database.
+- Key-value layer: `Request`, `Op` and `Reply`, and a `StateMachine` on katman with one row per client session so that a retried request is carried out once.
+- A restarting node resumes from the state machine's applied index.
+- Simulator: clients with retries, a linearizability checker per key, and a comparison of all state machines.
 - Simulator faults: slow disks and power cuts with restart from storage.
 - Deterministic simulator with message drop, duplication, delay and partitions, checking election safety, log matching, leader completeness, state machine safety and recovery after faults.

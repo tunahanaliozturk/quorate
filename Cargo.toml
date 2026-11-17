@@ -21,6 +21,11 @@ katman = { version = "0.0.0", git = "https://github.com/tunahanaliozturk/katman"
 # The simulator runs storage on katman's simulated filesystem.
 katman = { version = "0.0.0", git = "https://github.com/tunahanaliozturk/katman", rev = "dd90433d0273ef0d7d87e228813afdb1e0f10f01", features = ["sim"] }
 
+# The simulator runs 10,000 seeds in the test suite. Optimised, that takes a third of the time.
+# Debug assertions and overflow checks stay on.
+[profile.test]
+opt-level = 2
+
 [lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"

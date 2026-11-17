@@ -90,6 +90,9 @@ pub enum ConfigError {
     HeartbeatNotBelowElection,
     /// The batch size is zero, so no entry could ever be sent.
     ZeroBatch,
+    /// The state machine has applied more entries than the log holds. The node's storage is
+    /// damaged and it must not start.
+    AppliedPastLog,
 }
 
 impl fmt::Display for ConfigError {
@@ -101,6 +104,7 @@ impl fmt::Display for ConfigError {
                 "the heartbeat interval must be at least 1 and below the election timeout",
             ),
             Self::ZeroBatch => f.write_str("the batch size must be at least 1"),
+            Self::AppliedPastLog => f.write_str("the state machine is ahead of the log"),
         }
     }
 }

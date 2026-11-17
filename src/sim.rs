@@ -1,8 +1,8 @@
 //! A deterministic cluster simulator.
 //!
-//! One thread owns every node, the network between them, their disks and a virtual clock. A seed
-//! decides the cluster size, the fault rates and every random choice after that, so a failing
-//! seed replays the same run step for step.
+//! One thread owns every node, the network between them, their disks, the clients and a virtual
+//! clock. A seed decides the cluster size, the fault rates and every random choice after that, so
+//! a failing seed replays the same run step for step.
 //!
 //! Faults:
 //!
@@ -10,24 +10,39 @@
 //! - The network is partitioned in several shapes.
 //! - Disks are slow: a write completes some ticks after it was requested.
 //! - Nodes lose power. A node that goes down forgets everything in memory and every write that
-//!   had not completed. Its storage is a katman database on katman's simulated filesystem, which
-//!   drops unsynced bytes on a power cut. It restarts later from what that database holds.
+//!   had not completed. Its log and its state machine are katman databases on katman's simulated
+//!   filesystem, which drops unsynced bytes on a power cut. It restarts later from what they hold.
+//! - Clients lose requests and replies, give up waiting and send the same request to another
+//!   node, and now and then send an old request again.
 //!
 //! Checked after every step: election safety, state machine safety, leader completeness, and that
 //! no node applies an entry before its own disk has it.
 //! Checked every few ticks and at the end: log matching, and that committed entries never change.
 //! At the end every node is restarted, the network heals and the cluster has to converge on one
-//! log that holds every entry that was ever committed, and then commit something new.
+//! log that holds every entry that was ever committed, answer every client, and commit something
+//! new. Then the history of every key is checked for linearizability, and the state machines of
+//! all nodes are compared.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use katman::{Options, SimFs, Torn};
 
 use crate::Config;
+use crate::kv::{Op, Reply, Request, SessionId};
+use crate::linearizability::{Call, Operation, Return, linearizable};
 use crate::raft::{Bug, Raft, Role};
 use crate::rng::Rng;
+use crate::state::{Outcome, StateMachine};
 use crate::storage::{Recovered, Storage};
 use crate::types::{Entry, Index, Input, Message, NodeId, Output, Persist, Term};
+
+/// Keys the clients work on. Few, so that their operations collide.
+const KEYS: usize = 2;
+/// Values the clients write. Few, so that a compare-and-set often finds what it expects.
+const VALUES: u64 = 3;
+const CLIENTS: u64 = 3;
+/// How long a client waits for an answer before it sends its request again.
+const CLIENT_TIMEOUT: u64 = 20;
 
 /// A broken promise. Nodes are named by their position in the cluster, starting at 0.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +63,10 @@ pub(crate) enum Violation {
     AppliedBeforeDurable { node: usize, index: Index },
     /// A node's log no longer holds an entry it had committed.
     CommittedEntryChanged { node: usize, index: usize },
+    /// What the clients saw on this key cannot be explained by any order of their operations.
+    NotLinearizable { key: usize },
+    /// A node's state machine differs from node 0's although both applied the same log.
+    StateDiverged { node: usize },
     /// The healed cluster did not make progress.
     Liveness { reason: &'static str },
 }
@@ -68,6 +87,7 @@ struct Envelope {
 struct Live {
     raft: Raft,
     storage: Storage,
+    state: StateMachine,
     /// Writes the disk has not finished, with the tick at which each completes.
     disk: VecDeque<(u64, Persist)>,
 }
@@ -79,6 +99,28 @@ struct Node {
     /// `None` while the node is down.
     live: Option<Live>,
     restart_at: u64,
+    /// How many times the node has started. A client that was waiting on an earlier life of the
+    /// node gets no answer from a later one.
+    life: u64,
+}
+
+/// The request a client is waiting on.
+struct Waiting {
+    request: Vec<u8>,
+    key: usize,
+    /// Position of the operation in the key's history.
+    slot: usize,
+    /// The node the request went to, and which life of it.
+    target: Option<(usize, u64)>,
+    sent_at: u64,
+}
+
+struct Client {
+    session: SessionId,
+    seq: u64,
+    waiting: Option<Waiting>,
+    /// The last request that was answered, to send again as a stray copy.
+    answered: Option<Vec<u8>>,
 }
 
 pub(crate) struct Sim {
@@ -101,6 +143,13 @@ pub(crate) struct Sim {
     /// Every entry any node has applied, by position.
     committed: Vec<Entry>,
     next_command: u64,
+    clients: Vec<Client>,
+    /// Whether clients start new operations and lose requests and replies.
+    clients_busy: bool,
+    /// What the clients did and saw, per key.
+    histories: Vec<Vec<Operation>>,
+    /// The clock of the histories: one tick per invocation or return.
+    events: u64,
 }
 
 fn to_usize(value: u64) -> usize {
@@ -119,6 +168,30 @@ fn position_of(id: NodeId) -> usize {
     to_usize(id.get() - 1)
 }
 
+fn key_bytes(key: usize) -> Vec<u8> {
+    vec![b'k', u8::try_from(key).expect("there are few keys")]
+}
+
+fn value_bytes(value: u64) -> Vec<u8> {
+    value.to_be_bytes().to_vec()
+}
+
+fn value_of(bytes: &[u8]) -> u64 {
+    u64::from_be_bytes(
+        bytes
+            .try_into()
+            .expect("clients only write eight-byte values"),
+    )
+}
+
+fn returned(reply: &Reply) -> Return {
+    match reply {
+        Reply::Done => Return::Done,
+        Reply::Value(value) => Return::Value(value.as_deref().map(value_of)),
+        Reply::Swapped(swapped) => Return::Swapped(*swapped),
+    }
+}
+
 impl Sim {
     pub(crate) fn new(seed: u64, bug: Option<Bug>) -> Self {
         let mut rng = Rng::new(seed);
@@ -134,7 +207,16 @@ impl Sim {
                     fs: SimFs::new(),
                     live: None,
                     restart_at: 0,
+                    life: 0,
                 }
+            })
+            .collect();
+        let clients = (0..CLIENTS)
+            .map(|client| Client {
+                session: SessionId::new(1000 + client),
+                seq: 0,
+                waiting: None,
+                answered: None,
             })
             .collect();
         let mut sim = Self {
@@ -152,6 +234,10 @@ impl Sim {
             leaders: HashMap::new(),
             committed: Vec::new(),
             next_command: 0,
+            clients,
+            clients_busy: true,
+            histories: vec![Vec::new(); KEYS],
+            events: 0,
             rng,
         };
         for node in 0..size {
@@ -161,8 +247,8 @@ impl Sim {
     }
 
     /// Runs `ticks` of faults, then heals everything and checks that the cluster recovers.
-    /// Returns how many entries were committed.
-    pub(crate) fn run(mut self, ticks: u64) -> Result<usize, Violation> {
+    /// Returns how many entries were committed and how many client operations completed.
+    pub(crate) fn run(mut self, ticks: u64) -> Result<(usize, usize), Violation> {
         for _ in 0..ticks {
             if self.chance(3) {
                 self.change_partition();
@@ -172,8 +258,8 @@ impl Sim {
                 self.crash(node);
             }
             self.advance()?;
-            if self.chance(30) {
-                self.propose()?;
+            if self.chance(10) {
+                self.propose_junk()?;
             }
             if self.now.is_multiple_of(32) {
                 self.check_logs()?;
@@ -181,7 +267,10 @@ impl Sim {
         }
         self.check_logs()?;
         self.settle()?;
-        Ok(self.committed.len())
+        Ok((
+            self.committed.len(),
+            self.histories.iter().map(Vec::len).sum(),
+        ))
     }
 
     fn chance(&mut self, percent: u64) -> bool {
@@ -211,22 +300,29 @@ impl Sim {
     /// Starts a node from whatever its disk holds.
     fn boot(&mut self, node: usize) {
         let slot = &mut self.nodes[node];
-        let options = Options::default().with_sim_fs(slot.fs.clone());
+        let options = || Options::default().with_sim_fs(slot.fs.clone());
         let Recovered {
             storage,
             hard_state,
             log,
-        } = Storage::open("node", options).expect("storage opens after any crash");
+        } = Storage::open("log", options()).expect("storage opens after any crash");
+        let mut state = StateMachine::open("state", options())
+            .expect("the state machine opens after any crash");
         // A new seed each time, or a node would repeat the election timeouts of its last life.
         slot.config.seed = self.rng.next_u64();
-        let mut raft = Raft::recover(slot.config.clone(), hard_state, log)
-            .expect("the simulator builds valid configurations");
+        let mut raft = Raft::recover(slot.config.clone(), hard_state, log, state.applied_index())
+            .expect("the state machine is never ahead of the log");
         if let Some(bug) = self.bug {
             raft.inject(bug);
         }
+        if self.bug == Some(Bug::ApplyRetriesAgain) {
+            state.inject_apply_retries_again();
+        }
+        slot.life += 1;
         slot.live = Some(Live {
             raft,
             storage,
+            state,
             disk: VecDeque::new(),
         });
     }
@@ -243,8 +339,8 @@ impl Sim {
         slot.restart_at = self.now + 1 + self.rng.below(60);
     }
 
-    /// Moves the clock one tick: restarts nodes, finishes disk writes, delivers messages, then
-    /// ticks every node.
+    /// Moves the clock one tick: restarts nodes, finishes disk writes, delivers messages, ticks
+    /// every node, then lets the clients act.
     fn advance(&mut self) -> Result<(), Violation> {
         self.now += 1;
         for node in 0..self.nodes.len() {
@@ -272,6 +368,9 @@ impl Sim {
         for node in 0..self.nodes.len() {
             self.step(node, Input::Tick)?;
         }
+        for client in 0..self.clients.len() {
+            self.act(client)?;
+        }
         Ok(())
     }
 
@@ -294,18 +393,17 @@ impl Sim {
     }
 
     /// Hands a write to the node's disk. It finishes after a random delay, in request order.
-    fn start_write(&mut self, node: usize, persist: Persist) -> Result<(), Violation> {
+    /// A write that finishes at once is handed back, for the caller to complete.
+    fn start_write(&mut self, node: usize, persist: Persist) -> Option<Persist> {
         let delay = self.rng.below(self.max_disk_delay + 1);
-        let Some(live) = self.nodes[node].live.as_mut() else {
-            return Ok(());
-        };
+        let live = self.nodes[node].live.as_mut()?;
         if delay == 0 && live.disk.is_empty() {
-            return self.finish_write(node, &persist);
+            return Some(persist);
         }
         let after_earlier_writes = live.disk.back().map_or(0, |(at, _)| *at);
         live.disk
             .push_back(((self.now + delay).max(after_earlier_writes), persist));
-        Ok(())
+        None
     }
 
     /// Feeds one input to a node and carries out what it asks for. A node that is down ignores it.
@@ -313,15 +411,22 @@ impl Sim {
         let Some(live) = self.nodes[node].live.as_mut() else {
             return Ok(());
         };
+        let mut finished = None;
         for output in live.raft.step(input) {
             match output {
-                Output::Persist(persist) => self.start_write(node, persist)?,
+                Output::Persist(persist) => finished = self.start_write(node, persist),
                 Output::Send { to, message } => self.send(node, position_of(to), &message),
-                Output::Apply { index, entry } => self.record(node, index, entry)?,
+                Output::Apply { index, entry } => self.apply(node, index, entry)?,
                 Output::NotLeader { .. } => {}
             }
         }
-        self.check_leader(node)
+        self.check_leader(node)?;
+        // Only now, after everything this step asked for is done. Telling the node earlier would
+        // run a second step inside the first and apply later entries before earlier ones.
+        match finished {
+            Some(persist) => self.finish_write(node, &persist),
+            None => Ok(()),
+        }
     }
 
     fn send(&mut self, from: usize, to: usize, message: &Message) {
@@ -347,9 +452,26 @@ impl Sim {
         }
     }
 
-    /// Proposes a fresh command to a node that believes it is the leader. That includes leaders
-    /// cut off from the majority, whose entries can never commit.
-    fn propose(&mut self) -> Result<(), Violation> {
+    /// A committed entry reaches a node's state machine, and its answer may reach a client.
+    fn apply(&mut self, node: usize, index: Index, entry: Entry) -> Result<(), Violation> {
+        let outcome = match self.nodes[node].live.as_mut() {
+            Some(live) => live
+                .state
+                .apply(index, &entry)
+                .expect("entries arrive in order on a disk that works"),
+            None => None,
+        };
+        self.record(node, index, entry)?;
+        if let Some(outcome) = outcome {
+            self.answer(node, &outcome);
+        }
+        Ok(())
+    }
+
+    /// Proposes bytes that are not a request to a node that believes it is the leader. That
+    /// includes leaders cut off from the majority, whose entries can never commit. The state
+    /// machines have to agree that the entry changes nothing.
+    fn propose_junk(&mut self) -> Result<(), Violation> {
         let leaders = self.leaders();
         if leaders.is_empty() {
             return Ok(());
@@ -361,6 +483,139 @@ impl Sim {
             Input::Propose(self.next_command.to_be_bytes().to_vec()),
         )
     }
+
+    // ---- Clients. ----
+
+    /// One client's turn: maybe start an operation, send or resend what it is waiting on, and
+    /// now and then send a stray copy of an old request.
+    fn act(&mut self, client: usize) -> Result<(), Violation> {
+        if self.clients[client].waiting.is_none() && self.clients_busy && self.chance(40) {
+            self.invoke(client);
+        }
+        let overdue = self.clients[client]
+            .waiting
+            .as_ref()
+            .is_some_and(|waiting| {
+                waiting.target.is_none() || self.now - waiting.sent_at > CLIENT_TIMEOUT
+            });
+        if overdue {
+            self.send_request(client)?;
+        }
+        if self.clients_busy
+            && self.chance(2)
+            && let Some(old) = self.clients[client].answered.clone()
+        {
+            let node = self.pick(self.nodes.len());
+            self.step(node, Input::Propose(old))?;
+        }
+        Ok(())
+    }
+
+    /// Starts a new operation and writes its invocation into the history.
+    fn invoke(&mut self, client: usize) {
+        let key = self.pick(KEYS);
+        let value = self.rng.below(VALUES);
+        let call = match self.rng.below(4) {
+            0 => Call::Get,
+            1 => Call::Put(value),
+            2 => Call::Delete,
+            _ => {
+                let expected = match self.rng.below(VALUES + 1) {
+                    0 => None,
+                    other => Some(other - 1),
+                };
+                Call::CompareAndSet { expected, value }
+            }
+        };
+        let op = match call {
+            Call::Get => Op::Get {
+                key: key_bytes(key),
+            },
+            Call::Put(value) => Op::Put {
+                key: key_bytes(key),
+                value: value_bytes(value),
+            },
+            Call::Delete => Op::Delete {
+                key: key_bytes(key),
+            },
+            Call::CompareAndSet { expected, value } => Op::CompareAndSet {
+                key: key_bytes(key),
+                expected: expected.map(value_bytes),
+                value: value_bytes(value),
+            },
+        };
+        self.events += 1;
+        self.histories[key].push(Operation {
+            call,
+            invoked: self.events,
+            returned: None,
+        });
+
+        let slot = self.histories[key].len() - 1;
+        let client = &mut self.clients[client];
+        client.seq += 1;
+        let request = Request::new(client.session, client.seq, op).encode();
+        client.waiting = Some(Waiting {
+            request,
+            key,
+            slot,
+            target: None,
+            sent_at: self.now,
+        });
+    }
+
+    /// Sends the request the client is waiting on to a node: usually one that claims to lead,
+    /// sometimes any. The request may be lost on the way.
+    fn send_request(&mut self, client: usize) -> Result<(), Violation> {
+        let leaders = self.leaders();
+        let node = if !leaders.is_empty() && self.chance(80) {
+            leaders[self.pick(leaders.len())]
+        } else {
+            self.pick(self.nodes.len())
+        };
+        let lost = self.clients_busy && self.chance(10);
+        let life = self.nodes[node].life;
+        let Some(waiting) = self.clients[client].waiting.as_mut() else {
+            return Ok(());
+        };
+        waiting.target = Some((node, life));
+        waiting.sent_at = self.now;
+        if lost {
+            return Ok(());
+        }
+        let request = waiting.request.clone();
+        self.step(node, Input::Propose(request))
+    }
+
+    /// A node applied a request and answers the client, if the client is still waiting on this
+    /// node for this request. The answer may be lost on the way.
+    fn answer(&mut self, node: usize, outcome: &Outcome) {
+        let lost = self.clients_busy && self.chance(10);
+        let life = self.nodes[node].life;
+        let Some(client) = self
+            .clients
+            .iter_mut()
+            .find(|client| client.session == outcome.session)
+        else {
+            return;
+        };
+        let expected = client.seq == outcome.seq
+            && client
+                .waiting
+                .as_ref()
+                .is_some_and(|waiting| waiting.target == Some((node, life)));
+        if !expected || lost {
+            return;
+        }
+        if let Some(waiting) = client.waiting.take() {
+            self.events += 1;
+            self.histories[waiting.key][waiting.slot].returned =
+                Some((self.events, returned(&outcome.reply)));
+            client.answered = Some(waiting.request);
+        }
+    }
+
+    // ---- Faults. ----
 
     fn change_partition(&mut self) {
         let size = self.nodes.len();
@@ -399,9 +654,10 @@ impl Sim {
         }
     }
 
+    // ---- Checks. ----
+
     /// A node must have stored an entry durably before it applies it. Then state machine safety:
-    /// every node applies the same entry at each index. A node that
-    /// restarted applies its log again from the start, and has to match what it applied before.
+    /// every node applies the same entry at each index.
     fn record(&mut self, node: usize, index: Index, entry: Entry) -> Result<(), Violation> {
         let in_flight = self.nodes[node].live.as_ref().is_some_and(|live| {
             let touches = |persist: &Persist| {
@@ -485,28 +741,31 @@ impl Sim {
         Ok(())
     }
 
-    /// Whether every node is up and holds the whole committed log and nothing else.
-    fn converged(&self) -> bool {
+    /// Whether every node is up and holds the whole committed log and nothing else, and no
+    /// client is still waiting.
+    fn quiet(&self) -> bool {
         let length = self.committed.len();
         self.up().count() == self.nodes.len()
+            && self.clients.iter().all(|client| client.waiting.is_none())
             && self.up().all(|(_, raft)| {
                 raft.log().len() == length && to_usize(raft.commit_index().get()) == length
             })
     }
 
-    /// Advances until the nodes converge, for at most `budget` ticks.
-    fn advance_until_converged(&mut self, budget: u64) -> Result<bool, Violation> {
+    /// Advances until the cluster is quiet, for at most `budget` ticks.
+    fn advance_until_quiet(&mut self, budget: u64) -> Result<bool, Violation> {
         for _ in 0..budget {
-            if self.converged() {
+            if self.quiet() {
                 return Ok(true);
             }
             self.advance()?;
         }
-        Ok(self.converged())
+        Ok(self.quiet())
     }
 
-    /// Stops every fault and expects the cluster to recover: first every node ends up with the
-    /// same fully committed log, then a new write commits everywhere within a fixed time.
+    /// Stops every fault and expects the cluster to recover: every node ends up with the same
+    /// fully committed log, every client gets its answer, and a new write commits everywhere
+    /// within a fixed time. Then the histories and the state machines are checked.
     ///
     /// Converging on the record of applied entries is also the durability check. Every entry a
     /// node ever applied is in that record, so an entry lost in a crash shows up here as a log
@@ -519,6 +778,7 @@ impl Sim {
         self.max_delay = 1;
         self.max_disk_delay = 0;
         self.crash_per_mille = 0;
+        self.clients_busy = false;
         for node in &mut self.nodes {
             node.restart_at = 0;
         }
@@ -531,20 +791,30 @@ impl Sim {
             .max()
             .unwrap_or(0);
         let budget = 300 + 4 * to_u64(longest.max(self.committed.len()));
-        if !self.advance_until_converged(budget)? {
+        if !self.advance_until_quiet(budget)? {
             return Err(Violation::Liveness {
-                reason: "the nodes did not converge after the faults stopped",
+                reason: "the cluster did not settle after the faults stopped",
             });
         }
 
         let before = self.committed.len();
-        self.propose()?;
-        if !self.advance_until_converged(50)? || self.committed.len() <= before {
+        self.propose_junk()?;
+        if !self.advance_until_quiet(50)? || self.committed.len() <= before {
             return Err(Violation::Liveness {
                 reason: "a write after recovery did not commit everywhere",
             });
         }
-        self.check_logs()
+        self.check_logs()?;
+
+        if let Some(key) = (0..KEYS).find(|&key| !linearizable(&self.histories[key])) {
+            return Err(Violation::NotLinearizable { key });
+        }
+        let dump = |node: &Node| node.live.as_ref().map(|live| live.state.dump());
+        let reference = self.nodes.first().and_then(dump);
+        match (1..size).find(|&node| dump(&self.nodes[node]) != reference) {
+            Some(node) => Err(Violation::StateDiverged { node }),
+            None => Ok(()),
+        }
     }
 }
 
@@ -586,7 +856,7 @@ mod tests {
         let range = seeds();
         let next = AtomicU64::new(range.start);
         let failures = Mutex::new(Vec::new());
-        let committed = AtomicU64::new(0);
+        let operations = AtomicU64::new(0);
         let workers = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
 
         std::thread::scope(|scope| {
@@ -598,8 +868,8 @@ mod tests {
                             break;
                         }
                         match Sim::new(seed, None).run(TICKS) {
-                            Ok(entries) => {
-                                committed.fetch_add(super::to_u64(entries), Ordering::Relaxed);
+                            Ok((_, completed)) => {
+                                operations.fetch_add(super::to_u64(completed), Ordering::Relaxed);
                             }
                             Err(violation) => failures
                                 .lock()
@@ -617,8 +887,8 @@ mod tests {
             failures.is_empty(),
             "failing seeds (replay with QUORATE_SEED=n): {failures:?}"
         );
-        // A run that commits nothing would pass every safety check without testing anything.
-        assert!(committed.load(Ordering::Relaxed) > 0);
+        // A run in which no client got an answer would pass every check without testing anything.
+        assert!(operations.load(Ordering::Relaxed) > 0);
     }
 
     #[test]
@@ -645,6 +915,15 @@ mod tests {
         assert!(
             found.is_some(),
             "no seed below 1,000 exposed acknowledging before durable"
+        );
+    }
+
+    #[test]
+    fn carrying_out_a_retried_request_twice_is_caught() {
+        let found = first_safety_violation(Bug::ApplyRetriesAgain, 1_000);
+        assert!(
+            matches!(found, Some((_, Violation::NotLinearizable { .. }))),
+            "expected a history that is not linearizable, got {found:?}"
         );
     }
 

@@ -40,6 +40,8 @@ pub enum Role {
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Bug {
+    /// Not a rule of the core: the state machine carries out a retried request a second time.
+    ApplyRetriesAgain,
     /// Commit an entry from an earlier term by counting replicas (Raft paper, figure 8).
     CommitEarlierTerm,
     /// Grant a vote without checking that the candidate's log is up to date.
@@ -120,25 +122,30 @@ impl Raft {
     /// peer twice, the heartbeat is not shorter than the election timeout, or the batch size is
     /// zero.
     pub fn new(config: Config) -> Result<Self, ConfigError> {
-        Self::recover(config, HardState::default(), Vec::new())
+        Self::recover(config, HardState::default(), Vec::new(), Index::ZERO)
     }
 
     /// Restarts a node from what its storage held. It comes back as a follower.
     ///
-    /// `log` must be exactly the durable log, with the entry for index 1 first. The commit index
-    /// is not stored; the node learns it again from the leader, and emits [`Output::Apply`] from
-    /// index 1 again.
+    /// `log` must be exactly the durable log, with the entry for index 1 first. `applied` is how
+    /// far the state machine got. Those entries were committed, so the node starts with its
+    /// commit index there and emits [`Output::Apply`] from the entry after it.
     ///
     /// # Errors
     ///
-    /// Returns a [`ConfigError`] for the same reasons as [`Raft::new`].
+    /// Returns a [`ConfigError`] for the same reasons as [`Raft::new`], and
+    /// [`ConfigError::AppliedPastLog`] when `applied` is beyond the end of `log`.
     pub fn recover(
         config: Config,
         hard_state: HardState,
         log: Vec<Entry>,
+        applied: Index,
     ) -> Result<Self, ConfigError> {
         config.validate()?;
         let log = Log::from_entries(log);
+        if applied > log.last_index() {
+            return Err(ConfigError::AppliedPastLog);
+        }
         let mut node = Self {
             id: config.id,
             peers: config.peers,
@@ -150,8 +157,8 @@ impl Raft {
             voted_for: hard_state.voted_for(),
             durable_index: log.last_index(),
             log,
-            commit: Index::ZERO,
-            applied: Index::ZERO,
+            commit: applied,
+            applied,
             state: State::Follower { leader: None },
             elapsed: 0,
             timeout: 0,

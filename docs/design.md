@@ -53,7 +53,7 @@ Protocol features, in the order they are built:
 Two katman databases per node.
 
 - **Log database**: the hard state (current term, vote) under one key, and the Raft log with entry `i` under `l` plus `i` as eight big-endian bytes. Always opened with `SyncMode::Always`. Each write request from the core is one atomic batch. A conflicting tail is replaced in the same batch that writes the new entries. See [ADR 0002](adr/0002-raft-log-in-katman.md).
-- **State database** (milestone 3): the key-value data, the client session table and `applied_index`. Each apply writes all three in one `WriteBatch`, so a crash cannot apply an entry twice or skip one.
+- **State database**: the key-value data, one row per client session and the index of the last entry applied. Each apply writes all three in one `WriteBatch`, so a crash cannot apply an entry twice or skip one. This database is not synced: after a power cut it holds the result of some prefix of the log, and the node applies the rest again. See [ADR 0003](adr/0003-state-machine-unsynced-with-client-chosen-sessions.md).
 
 The core does not wait for the disk. It emits `Output::Persist` with a sequence number and is told with `Input::Persisted` when that write is durable. Until then it holds back every message, counts its own log towards a quorum only up to its durable index, and applies nothing past that index.
 
@@ -61,7 +61,13 @@ katman is not yet published on crates.io. Until it is, quorate depends on it by 
 
 ### Client sessions
 
-A client registers and gets a session id. Each request carries the session id and a sequence number. The state machine stores the last sequence number and reply per session, and returns the stored reply for a duplicate. Without this, a retry after a lost reply would apply twice and break linearizability.
+A client picks a random 64-bit session id. Each request carries the session id and a sequence number, and a session has one request in flight at a time. The state machine stores the highest sequence number and its reply per session. A request with that same number gets the stored reply; one with a lower number is ignored. Without this, a retry after a lost reply would apply twice and break linearizability.
+
+Sessions do not expire yet, so the table only grows.
+
+### Reads
+
+Until ReadIndex arrives in milestone 4, a read is a log entry like any other operation.
 
 ### Transport and wire format
 
@@ -81,6 +87,8 @@ Faults:
 - Partitions: symmetric, one-way, and a leader isolated from the majority.
 - Power cuts. The node loses its memory and every write that had not completed. Storage runs on katman's `SimFs`, which discards unsynced bytes; the node restarts later from what the database holds.
 - Slow disks: a write completes some ticks after it was requested, in request order.
+- Clients: requests and replies are lost, a client that waits too long sends the same request to another node, and old requests are sent again at random.
+- Bytes that are not a request are proposed, to check that every node ignores them the same way.
 - Clock skew between nodes, within a configured bound (not built yet).
 
 Checks, after every step:
@@ -97,7 +105,8 @@ Checks, every 32 ticks and at the end (they compare whole logs, which is too slo
 
 Checks, at the end of a run:
 
-- **Linearizability**: the recorded client history (invoke and return times, results) is checked against a key-value model.
+- **Linearizability**: the history of each key (invocations, returns and results, on one shared clock) is searched for an order that a single-threaded store could have produced. The checker is the Wing and Gong search with memoisation, and has its own tests.
+- **Identical stores**: the state machines of all nodes hold the same bytes.
 - **Liveness and durability**: after faults stop and every node is back, all nodes converge on one fully committed log that holds every entry any node ever applied, and a new write then commits everywhere within 50 ticks.
 
 A failing run prints its seed. Setting `QUORATE_SEED=N` replays that run step for step.
@@ -109,11 +118,12 @@ A simulator that never fails proves nothing. The test suite includes known-wrong
 - Commit an entry from an earlier term by counting replicas (the bug in Figure 8 of the Raft paper).
 - Grant a vote without checking that the candidate's log is up to date.
 - Acknowledge an append before it is durable.
-- Answer a read from a leader that has not confirmed its leadership.
+- Carry out a retried request a second time.
+- Answer a read from a leader that has not confirmed its leadership (milestone 4).
 
 ## Errors
 
-A node stops, loudly, when storage reports corruption or when an invariant fails. It does not try to continue with state it cannot trust. Client-facing errors are `NotLeader { hint }`, `Timeout` and `SessionExpired`; a `Timeout` means the outcome is unknown and the client retries with the same sequence number.
+A node stops, loudly, when storage reports corruption or when an invariant fails. It does not try to continue with state it cannot trust. Client-facing errors are `NotLeader { hint }` and `Timeout`; a `Timeout` means the outcome is unknown and the client retries with the same sequence number.
 
 ## Benchmarks
 
