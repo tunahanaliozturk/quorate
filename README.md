@@ -6,7 +6,16 @@ A meeting is *quorate* when enough members are present to make a binding decisio
 
 ## Status
 
-Planning. The repository holds the design and the roadmap; no functional code yet.
+Milestone 1 of 8 is done: the Raft core (leader election and log replication, in memory) and the simulator that tests it. There is no storage, no key-value layer and no network yet, so this is not usable as a database.
+
+What the simulator shows today, all reproducible with `cargo test`:
+
+- 10,000 seeds, each 1,500 ticks of dropped, duplicated and delayed messages and changing partitions on a cluster of three or five nodes, break no safety property. The first 1,000 seeds commit 283 entries each on average, 70 at least.
+- After the faults stop, every seed converges on one fully committed log and commits a new write.
+- With the term check on commit removed (the bug in figure 8 of the Raft paper), 13 of the first 1,000 seeds report a violation; the first is seed 67. This bug needs a long chain of events, so it is rare.
+- With the log check on votes removed, 995 of the first 1,000 seeds report a violation.
+
+A failing seed replays exactly with `QUORATE_SEED=n cargo test`.
 
 - [docs/design.md](docs/design.md): what it does, what it does not do, and how each promise will be tested.
 - [docs/roadmap.md](docs/roadmap.md): milestones, each with an exit test.

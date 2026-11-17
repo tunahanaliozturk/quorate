@@ -42,7 +42,7 @@ The core has no threads, no sockets, no files, no `Instant::now()` and no global
 
 Protocol features, in the order they are built:
 
-- Leader election and log replication as in the Raft paper.
+- Leader election and log replication as in the Raft paper. A follower that refuses an append names the first index of its conflicting term, so the leader skips back a term per round trip.
 - Pre-vote and check-quorum, so a partitioned node does not disrupt the cluster when it returns.
 - Linearizable reads with ReadIndex: the leader confirms leadership with a heartbeat round before answering, without writing to the log.
 - Snapshots and log truncation, with InstallSnapshot for followers that fall behind.
@@ -86,14 +86,18 @@ Faults:
 Checks, after every step:
 
 - **Election safety**: at most one leader per term.
-- **Log matching**: two logs with the same index and term agree on everything before it.
 - **Leader completeness**: a committed entry appears in the log of every later leader.
 - **State machine safety**: no two nodes apply different entries at the same index.
+
+Checks, every 32 ticks and at the end (they compare whole logs, which is too slow for every step):
+
+- **Log matching**: two logs with the same index and term agree on everything before it.
+- **Committed entries stay**: the committed part of every node's log equals the record of applied entries.
 
 Checks, at the end of a run:
 
 - **Linearizability**: the recorded client history (invoke and return times, results) is checked against a key-value model.
-- **Liveness**: after faults stop, the cluster commits a new write within a bounded number of ticks.
+- **Liveness**: after faults stop, every node converges on one fully committed log, and a new write then commits everywhere within 50 ticks.
 
 A failing run prints its seed. Setting `QUORATE_SEED=N` replays that run step for step.
 

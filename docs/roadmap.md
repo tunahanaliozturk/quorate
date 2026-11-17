@@ -14,6 +14,11 @@ Each milestone ends with a test that has to pass. A milestone is not done becaus
 | M7 | Real network | TCP transport, server binary, client library and CLI, three-node compose file. | Real processes: `kill -9` of the leader under load loses no acknowledged write; the recorded history is linearizable. |
 | M8 | Numbers and release | Benchmarks, architecture diagrams, README with measured results. | `docs/benchmarks.md` reproducible from the listed commands. Tag v0.1.0. |
 
+## Progress
+
+- **M0**, 2026-11-17: done.
+- **M1**, 2026-11-17: done. 10,000 seeds pass in about 35 seconds on a laptop. The figure 8 commit bug is caught on 13 of the first 1,000 seeds (first at seed 67), the missing vote check on 995. Three more mutations tried by hand (follower commit index past the last new entry, two votes in one term, truncating on a duplicate append) were each caught on seed 0. The simulator also found that a follower with a long conflicting log was probed one entry per round trip and never caught up under load; rejections now carry the first index of the conflicting term.
+
 ## Order of work inside a milestone
 
 1. Write the check or the fault first, and see it fail.

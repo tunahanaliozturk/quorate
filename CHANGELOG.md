@@ -4,4 +4,6 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 ## Unreleased
 
-- Repository scaffold, design document and roadmap. No functional code yet.
+- Repository scaffold, design document and roadmap.
+- Raft core as a pure state machine: leader election, log replication, a no-op entry on election and a conflict hint for fast log back-up. State is in memory only.
+- Deterministic simulator with message drop, duplication, delay and partitions, checking election safety, log matching, leader completeness, state machine safety and recovery after faults.
