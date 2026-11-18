@@ -31,3 +31,7 @@ jobs:
         env:
           QUORATE_SEEDS: ${{ inputs.seeds || '200000' }}
         run: cargo test every_seed
+      - name: Replace every node of the cluster, many times
+        env:
+          QUORATE_REPLACEMENTS: "50000"
+        run: cargo test every_node_can_be_replaced

@@ -25,6 +25,7 @@ use std::collections::VecDeque;
 
 use crate::config::{Config, ConfigError};
 use crate::log::Log;
+use crate::membership::{Change, ChangeError, Membership};
 use crate::rng::Rng;
 use crate::types::{
     AppendOutcome, Entry, HardState, Index, Input, LogWrite, Message, NodeId, Output, Payload,
@@ -60,6 +61,8 @@ pub(crate) enum Bug {
     /// Not a rule of the core: the driver has the log compacted before the state machine is on
     /// disk.
     CompactBeforeCheckpoint,
+    /// Accept a membership change while an earlier one is not committed.
+    ChangeWhileInProgress,
     /// Answer a read without asking a quorum whether this node still leads.
     ReadWithoutQuorum,
     /// Start an election without asking first. Not a safety bug; used to show what pre-vote
@@ -118,7 +121,14 @@ enum State {
 #[derive(Debug)]
 pub struct Raft {
     id: NodeId,
-    peers: Vec<NodeId>,
+    /// The membership in force: the last configuration entry in the log, committed or not.
+    membership: Membership,
+    /// The index of that entry, or `floor_index` if the log holds none.
+    config_index: Index,
+    /// A committed position and the membership as of it, for when the log holds no
+    /// configuration entry: the start of the log, or the state machine's position at restart.
+    floor_index: Index,
+    floor_membership: Membership,
     election_ticks: u32,
     heartbeat_ticks: u32,
     max_batch: usize,
@@ -165,7 +175,7 @@ impl Raft {
     /// zero.
     pub fn new(config: Config) -> Result<Self, ConfigError> {
         let start = SnapshotMeta::default();
-        Self::recover(config, HardState::default(), start, Vec::new(), start)
+        Self::recover(config, HardState::default(), start, Vec::new(), start, None)
     }
 
     /// Restarts a node from what its storage held. It comes back as a follower.
@@ -173,7 +183,8 @@ impl Raft {
     /// `base` and `entries` are the durable log: the point it starts after, and the entries from
     /// there on. `applied` is how far the state machine got. Those entries were committed, so the
     /// node starts with its commit index there and emits [`Output::Apply`] from the entry after
-    /// it.
+    /// it. `membership` is the membership the state machine recorded for that position; without
+    /// one the node starts from [`Config::founding_membership`].
     ///
     /// The log may not agree with the state machine. That happens when a snapshot was installed
     /// and the node went down before its log was rewritten to match: the state machine is at the
@@ -191,6 +202,7 @@ impl Raft {
         base: SnapshotMeta,
         entries: Vec<Entry>,
         applied: SnapshotMeta,
+        membership: Option<Membership>,
     ) -> Result<Self, ConfigError> {
         config.validate()?;
         if applied.index() < base.index() {
@@ -201,9 +213,17 @@ impl Raft {
         if start_over {
             log.reset(applied);
         }
+        let floor_membership = match membership {
+            Some(membership) => membership,
+            None if config.joining => Membership::default(),
+            None => Membership::new(config.peers.into_iter().chain([config.id]), []),
+        };
         let mut node = Self {
             id: config.id,
-            peers: config.peers,
+            membership: Membership::default(),
+            config_index: Index::ZERO,
+            floor_index: applied.index(),
+            floor_membership,
             election_ticks: config.election_ticks,
             heartbeat_ticks: config.heartbeat_ticks,
             max_batch: config.max_batch,
@@ -228,6 +248,7 @@ impl Raft {
             #[cfg(test)]
             bug: None,
         };
+        node.reload_membership();
         node.reset_timer();
         Ok(node)
     }
@@ -247,14 +268,17 @@ impl Raft {
                 term,
                 round,
                 snapshot,
+                membership,
             } => {
                 if term > self.term {
                     self.become_follower(term, None, &mut produced);
                 }
-                self.on_snapshot(from, term, round, snapshot, &mut produced);
+                self.on_snapshot(from, term, round, snapshot, membership, &mut produced);
             }
+            Input::ChangeMembership(change) => self.change_membership(change, &mut produced),
             Input::Persisted { seq } => self.on_persisted(seq, &mut out),
         }
+        self.step_down_if_removed(&mut produced);
         if let Some(persist) = self.take_persist() {
             out.push(Output::Persist(persist));
         }
@@ -302,6 +326,13 @@ impl Raft {
         self.commit
     }
 
+    /// The membership in force on this node: the one in the last configuration entry of its log,
+    /// whether that entry is committed or not.
+    #[must_use]
+    pub const fn membership(&self) -> &Membership {
+        &self.membership
+    }
+
     /// The last index the node has handed out with [`Output::Apply`], or taken over from a
     /// snapshot. The log can be compacted up to here and no further.
     #[must_use]
@@ -335,7 +366,63 @@ impl Raft {
 
     /// Votes needed to win an election or commit an entry.
     fn quorum(&self) -> usize {
-        self.peers.len().div_ceil(2) + 1
+        self.membership.quorum()
+    }
+
+    /// Whether this node's vote counts. A learner, a node that was removed and a node that has
+    /// not been added yet do not start elections.
+    fn is_voter(&self) -> bool {
+        self.membership.is_voter(self.id)
+    }
+
+    /// Takes a membership into force. A leader starts replicating to members it did not know and
+    /// stops for those that are gone.
+    fn adopt(&mut self, membership: Membership) {
+        self.membership = membership;
+        let next = self.log.last_index().next();
+        let State::Leader { progress, .. } = &mut self.state else {
+            return;
+        };
+        progress.retain(|follower| self.membership.contains(follower.peer));
+        for member in self.membership.members() {
+            if member != self.id && !progress.iter().any(|follower| follower.peer == member) {
+                progress.push(Progress {
+                    peer: member,
+                    next,
+                    matched: Index::ZERO,
+                    acked_round: 0,
+                    active: false,
+                    snapshot: None,
+                });
+            }
+        }
+    }
+
+    /// Works out the membership in force from the log: its last configuration entry, or the
+    /// floor if it holds none. Needed whenever entries leave the log, at either end.
+    fn reload_membership(&mut self) {
+        let base = self.log.base().index().get();
+        let last = self
+            .log
+            .entries()
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(position, entry)| match entry.payload() {
+                Payload::Config(membership) => Some((position, membership.clone())),
+                Payload::Noop | Payload::Command(_) => None,
+            });
+        let (index, membership) = match last {
+            Some((position, membership)) => {
+                let offset = u64::try_from(position)
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(1);
+                (Index::new(base.saturating_add(offset)), membership)
+            }
+            None => (self.floor_index, self.floor_membership.clone()),
+        };
+        self.config_index = index;
+        self.adopt(membership);
     }
 
     /// Restarts the election timer with a fresh timeout in `election_ticks..2 * election_ticks`.
@@ -362,9 +449,20 @@ impl Raft {
     }
 
     fn append(&mut self, entry: Entry) {
+        let membership = match entry.payload() {
+            Payload::Config(membership) => Some(membership.clone()),
+            Payload::Noop | Payload::Command(_) => None,
+        };
         self.log.append(entry);
         let index = self.log.last_index();
         self.log_dirty_from = Some(self.log_dirty_from.map_or(index, |from| from.min(index)));
+        if let Some(membership) = membership {
+            // In force from the moment it is in the log, not from the moment it commits (Raft
+            // thesis 4.1). A node cannot tell when an entry commits elsewhere, so a rule based
+            // on commitment would have different nodes switch at different times anyway.
+            self.config_index = index;
+            self.adopt(membership);
+        }
     }
 
     /// Drops every entry after `index`, including from what is counted as durable: the entries
@@ -380,6 +478,10 @@ impl Raft {
         self.durable_index = self.durable_index.min(index);
         for (_, last) in &mut self.in_flight {
             *last = (*last).min(index);
+        }
+        if self.config_index > index {
+            // The membership entry in force was one of the entries that went.
+            self.reload_membership();
         }
     }
 
@@ -456,13 +558,19 @@ impl Raft {
             return;
         }
         self.elapsed = self.elapsed.saturating_add(1);
-        if self.elapsed >= self.timeout {
+        if self.elapsed < self.timeout {
+            return;
+        }
+        if self.is_voter() {
             self.pre_campaign(out);
+        } else {
+            self.reset_timer();
         }
     }
 
     fn leader_tick(&mut self, out: &mut Vec<Output>) {
         let quorum = self.quorum();
+        let own = usize::from(self.is_voter());
         let patience = self.election_ticks.saturating_mul(2);
         let State::Leader {
             progress,
@@ -481,13 +589,16 @@ impl Raft {
                 .map(|waited| waited + 1)
                 .filter(|&waited| waited < patience);
         }
-        // Check-quorum: a leader that has heard from fewer than a quorum for a whole election
-        // timeout is cut off. Its followers have given up on it or soon will, so it stops
-        // accepting work it could never commit.
+        // Check-quorum: a leader that has heard from fewer than a quorum of voters for a whole
+        // election timeout is cut off. Its followers have given up on it or soon will, so it
+        // stops accepting work it could never commit.
         *since_quorum_check += 1;
         if *since_quorum_check >= self.election_ticks {
             *since_quorum_check = 0;
-            let heard_from = 1 + progress.iter().filter(|follower| follower.active).count();
+            let voters = progress
+                .iter()
+                .filter(|follower| self.membership.is_voter(follower.peer));
+            let heard_from = own + voters.filter(|follower| follower.active).count();
             for follower in progress.iter_mut() {
                 follower.active = false;
             }
@@ -527,7 +638,7 @@ impl Raft {
         // previous leaders got, so its commit index may be behind.
         let knows_commit = self.log.term_at(index) == Some(self.term);
         let leader = self.leader();
-        let quorum = self.quorum();
+        let alone = self.is_voter() && self.quorum() == 1;
         let State::Leader { round, reads, .. } = &mut self.state else {
             out.push(Output::ReadRejected { id, leader });
             return;
@@ -536,7 +647,6 @@ impl Raft {
             out.push(Output::ReadRejected { id, leader });
             return;
         }
-        let alone = quorum == 1;
         #[cfg(test)]
         let alone = alone || self.bug == Some(Bug::ReadWithoutQuorum);
 
@@ -556,6 +666,7 @@ impl Raft {
     /// Releases the reads that a quorum has confirmed.
     fn confirm_reads(&mut self, out: &mut Vec<Output>) {
         let quorum = self.quorum();
+        let own = usize::from(self.is_voter());
         let State::Leader {
             progress, reads, ..
         } = &mut self.state
@@ -563,10 +674,13 @@ impl Raft {
             return;
         };
         while let Some(read) = reads.front() {
-            let confirmed = 1 + progress
+            let voters = progress
                 .iter()
-                .filter(|follower| follower.acked_round >= read.round)
-                .count();
+                .filter(|follower| self.membership.is_voter(follower.peer));
+            let confirmed = own
+                + voters
+                    .filter(|follower| follower.acked_round >= read.round)
+                    .count();
             if confirmed < quorum {
                 break;
             }
@@ -586,6 +700,7 @@ impl Raft {
     /// out with a term nobody else has seen.
     fn pre_campaign(&mut self, out: &mut Vec<Output>) {
         self.reset_timer();
+        // The only voter needs nobody's opinion.
         let direct = self.quorum() == 1;
         #[cfg(test)]
         let direct = direct || self.bug == Some(Bug::SkipPreVote);
@@ -602,11 +717,17 @@ impl Raft {
             last_log_index: self.log.last_index(),
             last_log_term: self.log.last_term(),
         };
-        for &peer in &self.peers {
-            out.push(Output::Send {
-                to: peer,
-                message: message.clone(),
-            });
+        self.send_to_other_voters(&message, out);
+    }
+
+    fn send_to_other_voters(&self, message: &Message, out: &mut Vec<Output>) {
+        for &voter in self.membership.voters() {
+            if voter != self.id {
+                out.push(Output::Send {
+                    to: voter,
+                    message: message.clone(),
+                });
+            }
         }
     }
 
@@ -627,35 +748,19 @@ impl Raft {
             last_log_index: self.log.last_index(),
             last_log_term: self.log.last_term(),
         };
-        for &peer in &self.peers {
-            out.push(Output::Send {
-                to: peer,
-                message: message.clone(),
-            });
-        }
+        self.send_to_other_voters(&message, out);
     }
 
     fn become_leader(&mut self, out: &mut Vec<Output>) {
-        let next = self.log.last_index().next();
-        let progress = self
-            .peers
-            .iter()
-            .map(|&peer| Progress {
-                peer,
-                next,
-                matched: Index::ZERO,
-                acked_round: 0,
-                active: false,
-                snapshot: None,
-            })
-            .collect();
         self.state = State::Leader {
-            progress,
+            progress: Vec::new(),
             since_heartbeat: 0,
             since_quorum_check: 0,
             round: 0,
             reads: VecDeque::new(),
         };
+        // Fills in the followers, each expected to continue right after this log.
+        self.adopt(self.membership.clone());
         // A leader may only commit by counting replicas of an entry from its own term. Without
         // this entry, earlier entries would wait for the next client command.
         self.append(Entry::new(self.term, Payload::Noop));
@@ -796,7 +901,7 @@ impl Raft {
         granted: bool,
         out: &mut Vec<Output>,
     ) {
-        if !granted || term != self.term.next() {
+        if !granted || term != self.term.next() || !self.membership.is_voter(from) {
             return;
         }
         let quorum = self.quorum();
@@ -835,7 +940,8 @@ impl Raft {
     }
 
     fn on_vote(&mut self, from: NodeId, term: Term, granted: bool, out: &mut Vec<Output>) {
-        if term != self.term || !granted {
+        // Only the voters of this node's membership elect it, whoever else may answer.
+        if term != self.term || !granted || !self.membership.is_voter(from) {
             return;
         }
         let quorum = self.quorum();
@@ -1011,6 +1117,10 @@ impl Raft {
         self.replicate(None, true, out);
     }
 
+    // ponytail: stop and wait. A follower is sent the batch at `next` again and again until it
+    // answers; the batch after it goes out only then. Throughput is one batch per round trip,
+    // which with a batch of one entry is less than a busy client produces. Sending ahead
+    // (advancing `next` when a batch goes out, falling back on a refusal) removes the ceiling.
     /// Sends one follower, or all of them, what they need next.
     ///
     /// A follower whose next entry is still in the log gets entries. One that needs entries the
@@ -1072,8 +1182,29 @@ impl Raft {
         if index <= self.log.base().index() {
             return;
         }
+        if index >= self.floor_index {
+            // The entry that set the membership may be among those that go. Remember what it
+            // said.
+            let count = index.get() - self.log.base().index().get();
+            let count = usize::try_from(count).unwrap_or(usize::MAX);
+            let covered = self
+                .log
+                .entries()
+                .iter()
+                .take(count)
+                .rev()
+                .find_map(|entry| match entry.payload() {
+                    Payload::Config(membership) => Some(membership.clone()),
+                    Payload::Noop | Payload::Command(_) => None,
+                });
+            if let Some(membership) = covered {
+                self.floor_membership = membership;
+            }
+            self.floor_index = index;
+        }
         self.log.compact_to(index);
         self.base_dirty = true;
+        self.reload_membership();
     }
 
     /// A snapshot arrived from the leader and the driver has put it into the state machine, if it
@@ -1084,6 +1215,7 @@ impl Raft {
         term: Term,
         round: u64,
         snapshot: SnapshotMeta,
+        membership: Membership,
         out: &mut Vec<Output>,
     ) {
         let outcome = if term < self.term {
@@ -1114,6 +1246,13 @@ impl Raft {
                 self.base_dirty = true;
                 self.commit = self.commit.max(snapshot.index());
                 self.applied = snapshot.index();
+                // The snapshot says who was in the cluster at its last entry. Entries the log
+                // kept after it may say something newer.
+                if !membership.voters().is_empty() {
+                    self.floor_index = snapshot.index();
+                    self.floor_membership = membership;
+                }
+                self.reload_membership();
             }
             // Everything up to the snapshot is committed, so it matches the leader's log.
             AppendOutcome::Accepted {
@@ -1133,9 +1272,16 @@ impl Raft {
         let State::Leader { progress, .. } = &self.state else {
             return;
         };
-        let mut stored: Vec<Index> = progress.iter().map(|follower| follower.matched).collect();
-        // The leader's own copy counts only once it is on disk, like everyone else's.
-        stored.push(self.durable_index);
+        let voters = progress
+            .iter()
+            .filter(|follower| self.membership.is_voter(follower.peer));
+        let mut stored: Vec<Index> = voters.map(|follower| follower.matched).collect();
+        // The leader's own copy counts only once it is on disk, like everyone else's, and only
+        // while the leader is a voter. A leader that has removed itself still runs the cluster
+        // until that change commits, without counting towards the majority that commits it.
+        if self.is_voter() {
+            stored.push(self.durable_index);
+        }
         stored.sort_unstable_by(|a, b| b.cmp(a));
         let Some(&candidate) = stored.get(self.quorum() - 1) else {
             return;
@@ -1152,6 +1298,64 @@ impl Raft {
 
         if from_this_term {
             self.commit = candidate;
+        }
+    }
+
+    // ---- Membership. ----
+
+    /// Starts a membership change, if this node leads and the change is allowed right now.
+    fn change_membership(&mut self, change: Change, out: &mut Vec<Output>) {
+        let State::Leader { progress, .. } = &self.state else {
+            out.push(Output::NotLeader {
+                leader: self.leader(),
+            });
+            return;
+        };
+        let caught_up = |peer: NodeId| {
+            progress
+                .iter()
+                .any(|follower| follower.peer == peer && follower.matched >= self.commit)
+        };
+        let verdict = if self.config_index > self.commit && !self.has_bug_change_in_progress() {
+            // One change at a time. Each single step is safe against the membership before it;
+            // two unfinished steps are not safe against each other.
+            Err(ChangeError::InProgress)
+        } else if self.log.term_at(self.commit) != Some(self.term) {
+            // A new leader may hold an uncommitted change from its predecessor without being
+            // able to tell. An entry of its own term has to commit first.
+            Err(ChangeError::NotReady)
+        } else if matches!(change, Change::Promote(peer) if !caught_up(peer) && self.membership.learners().contains(&peer))
+        {
+            Err(ChangeError::NotCaughtUp)
+        } else {
+            self.membership.apply(change)
+        };
+        match verdict {
+            Ok(membership) => {
+                self.append(Entry::new(self.term, Payload::Config(membership)));
+                self.broadcast_append(out);
+            }
+            Err(reason) => out.push(Output::ChangeRejected { change, reason }),
+        }
+    }
+
+    #[cfg(test)]
+    fn has_bug_change_in_progress(&self) -> bool {
+        self.bug == Some(Bug::ChangeWhileInProgress)
+    }
+
+    #[cfg(not(test))]
+    #[expect(clippy::unused_self, reason = "the test build reads a field here")]
+    const fn has_bug_change_in_progress(&self) -> bool {
+        false
+    }
+
+    /// A leader that is no longer a voter hands over once the change that removed it commits.
+    /// Until then it has to stay: someone must replicate that very entry.
+    fn step_down_if_removed(&mut self, out: &mut Vec<Output>) {
+        let leading = matches!(self.state, State::Leader { .. });
+        if leading && !self.is_voter() && self.config_index <= self.commit {
+            self.become_follower(self.term, None, out);
         }
     }
 
@@ -1178,6 +1382,7 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::{Bug, Raft, Role};
+    use crate::membership::{Change, ChangeError, Membership};
     use crate::types::{
         AppendOutcome, Entry, HardState, Index, Input, Message, NodeId, Output, Payload, ReadId,
         SnapshotMeta, Term,
@@ -1288,6 +1493,8 @@ mod tests {
         rejected: Vec<ReadId>,
         /// Snapshots a leader asked its driver to send, as (leader, follower).
         asked: Vec<(usize, NodeId)>,
+        /// Membership changes a leader refused.
+        refused: Vec<(Change, ChangeError)>,
         /// With a manual network, messages wait in the mailbox until the test delivers them.
         manual: bool,
         mailbox: Vec<(usize, usize, Message)>,
@@ -1326,9 +1533,20 @@ mod tests {
                 ready: Vec::new(),
                 rejected: Vec::new(),
                 asked: Vec::new(),
+                refused: Vec::new(),
                 manual: false,
                 mailbox: Vec::new(),
             }
+        }
+
+        /// Starts a node that is not a member of anything yet, and returns its position.
+        fn add_joiner(&mut self) -> usize {
+            let id = u64::try_from(self.nodes.len()).expect("few nodes") + 1;
+            let node =
+                Raft::new(Config::joining(NodeId::new(id), id)).expect("a valid configuration");
+            self.nodes.push(node);
+            self.cut_off.push(false);
+            self.nodes.len() - 1
         }
 
         fn position(&self, id: NodeId) -> usize {
@@ -1362,6 +1580,9 @@ mod tests {
                         Output::ReadReady { id, .. } => self.ready.push(id),
                         Output::ReadRejected { id, .. } => self.rejected.push(id),
                         Output::SendSnapshot { to, .. } => self.asked.push((node, to)),
+                        Output::ChangeRejected { change, reason } => {
+                            self.refused.push((change, reason));
+                        }
                         Output::Apply { .. } | Output::NotLeader { .. } => {}
                     }
                 }
@@ -1592,7 +1813,7 @@ mod tests {
     fn follower(base: SnapshotMeta, entries: Vec<Entry>, applied: SnapshotMeta) -> Raft {
         let config = Config::new(NodeId::new(1), [NodeId::new(2), NodeId::new(3)], 1);
         let hard_state = HardState::new(Term::new(1), None);
-        Raft::recover(config, hard_state, base, entries, applied).expect("consistent storage")
+        Raft::recover(config, hard_state, base, entries, applied, None).expect("consistent storage")
     }
 
     /// Feeds an input and reports every write as durable at once. Returns everything the node
@@ -1684,6 +1905,7 @@ mod tests {
                 term,
                 round: 0,
                 snapshot,
+                membership: Membership::default(),
             },
         );
         assert_eq!(cluster.nodes[behind].log_base(), snapshot);
@@ -1743,6 +1965,7 @@ mod tests {
             point(5, 1),
             Vec::new(),
             point(3, 1),
+            None,
         );
         assert_eq!(result.err(), Some(ConfigError::StateBehindLog));
     }
@@ -1780,6 +2003,7 @@ mod tests {
             term: Term::new(1),
             round: 4,
             snapshot: point(4, 1),
+            membership: Membership::default(),
         };
         let outputs = settle(&mut node, input);
 
@@ -1925,6 +2149,7 @@ mod tests {
             term: Term::new(1),
             round: 0,
             snapshot: point(4, 1),
+            membership: Membership::default(),
         };
         let outputs = settle(&mut node, input);
 
@@ -1948,11 +2173,302 @@ mod tests {
             term: Term::new(3),
             round: 0,
             snapshot: point(4, 3),
+            membership: Membership::default(),
         };
         settle(&mut node, input);
 
         assert_eq!(node.log_base(), point(4, 3));
         assert_eq!(node.log(), []);
         assert_eq!(node.commit_index(), Index::new(4));
+    }
+
+    fn voters(cluster: &Cluster, node: usize) -> Vec<u64> {
+        cluster.nodes[node]
+            .membership()
+            .voters()
+            .iter()
+            .map(|id| id.get())
+            .collect()
+    }
+
+    fn learners(cluster: &Cluster, node: usize) -> Vec<u64> {
+        cluster.nodes[node]
+            .membership()
+            .learners()
+            .iter()
+            .map(|id| id.get())
+            .collect()
+    }
+
+    #[test]
+    fn a_node_that_has_not_been_added_never_starts_an_election() {
+        let mut cluster = Cluster::new(3, None);
+        let outsider = cluster.add_joiner();
+        cluster.run(300);
+        assert_eq!(cluster.nodes[outsider].role(), Role::Follower);
+        assert_eq!(cluster.nodes[outsider].term(), Term::new(0));
+        assert_eq!(cluster.nodes[outsider].last_log_index(), Index::ZERO);
+    }
+
+    #[test]
+    fn a_learner_gets_the_log_and_does_not_count_towards_the_majority() {
+        let mut cluster = Cluster::new(3, None);
+        cluster.run(60);
+        let leader = cluster.leader();
+        let learner = cluster.add_joiner();
+        let id = cluster.nodes[learner].id();
+
+        cluster.feed(leader, Input::ChangeMembership(Change::AddLearner(id)));
+        cluster.run(4);
+        assert_eq!(learners(&cluster, leader), [4]);
+        // The learner has caught up, and learned the membership from the log.
+        assert_eq!(
+            cluster.nodes[learner].last_log_index(),
+            cluster.nodes[leader].last_log_index()
+        );
+        assert_eq!(
+            cluster.nodes[learner].membership(),
+            cluster.nodes[leader].membership()
+        );
+
+        // With both voters gone, the leader and the learner are two of four, and no majority of
+        // three. Nothing commits.
+        for node in 0..3 {
+            cluster.cut_off[node] = node != leader;
+        }
+        let committed = cluster.nodes[leader].commit_index();
+        cluster.feed(leader, Input::Propose(b"stuck".to_vec()));
+        cluster.run(3);
+        assert_eq!(
+            cluster.nodes[learner].last_log_index(),
+            cluster.nodes[leader].last_log_index()
+        );
+        assert_eq!(cluster.nodes[leader].commit_index(), committed);
+    }
+
+    #[test]
+    fn a_learner_is_promoted_only_once_it_has_caught_up() {
+        let mut cluster = Cluster::new(3, None);
+        cluster.run(60);
+        let leader = cluster.leader();
+        let learner = cluster.add_joiner();
+        let id = cluster.nodes[learner].id();
+
+        // Added while unreachable: it is a learner, and it has nothing.
+        cluster.cut_off[learner] = true;
+        cluster.feed(leader, Input::ChangeMembership(Change::AddLearner(id)));
+        cluster.feed(leader, Input::ChangeMembership(Change::Promote(id)));
+        assert_eq!(
+            cluster.refused,
+            [(Change::Promote(id), ChangeError::NotCaughtUp)]
+        );
+
+        cluster.cut_off[learner] = false;
+        cluster.run(4);
+        cluster.feed(leader, Input::ChangeMembership(Change::Promote(id)));
+        cluster.run(2);
+        assert_eq!(voters(&cluster, leader), [1, 2, 3, 4]);
+        assert_eq!(voters(&cluster, learner), [1, 2, 3, 4]);
+        assert_eq!(cluster.refused.len(), 1);
+    }
+
+    #[test]
+    fn a_second_change_waits_until_the_first_has_committed() {
+        let mut cluster = Cluster::new(3, None);
+        cluster.run(60);
+        let leader = cluster.leader();
+        let first = cluster.add_joiner();
+        let second = cluster.add_joiner();
+        let (first, second) = (cluster.nodes[first].id(), cluster.nodes[second].id());
+
+        // Nobody can acknowledge, so the first change stays uncommitted.
+        for node in 0..3 {
+            cluster.cut_off[node] = node != leader;
+        }
+        cluster.feed(leader, Input::ChangeMembership(Change::AddLearner(first)));
+        assert_eq!(
+            learners(&cluster, leader),
+            [first.get()],
+            "in force as soon as it is in the log"
+        );
+        cluster.feed(leader, Input::ChangeMembership(Change::AddLearner(second)));
+        assert_eq!(
+            cluster.refused,
+            [(Change::AddLearner(second), ChangeError::InProgress)]
+        );
+
+        cluster.cut_off = vec![false; cluster.nodes.len()];
+        cluster.run(3);
+        cluster.feed(leader, Input::ChangeMembership(Change::AddLearner(second)));
+        assert_eq!(learners(&cluster, leader), [first.get(), second.get()]);
+    }
+
+    #[test]
+    fn a_leader_that_removes_itself_hands_over_once_the_change_commits() {
+        let mut cluster = Cluster::new(3, None);
+        cluster.run(60);
+        let old = cluster.leader();
+        let id = cluster.nodes[old].id();
+        let remaining: Vec<u64> = (1..=3).filter(|&voter| voter != id.get()).collect();
+
+        cluster.feed(old, Input::ChangeMembership(Change::Remove(id)));
+        // The instant network has committed the change already, with the votes of the other two.
+        assert_ne!(cluster.nodes[old].role(), Role::Leader);
+        assert_eq!(voters(&cluster, old), remaining);
+
+        cluster.run(60);
+        let new = cluster.leader();
+        assert_ne!(new, old);
+        assert_eq!(voters(&cluster, new), remaining);
+        // The removed node hears nothing any more, and does not try to come back.
+        let term = cluster.nodes[new].term();
+        cluster.run(200);
+        assert_eq!(cluster.leader(), new);
+        assert_eq!(cluster.nodes[new].term(), term);
+    }
+
+    #[test]
+    fn a_membership_entry_that_is_overwritten_takes_its_membership_with_it() {
+        let mut node = follower(SnapshotMeta::default(), Vec::new(), SnapshotMeta::default());
+        let founding = node.membership().clone();
+        let grown = founding
+            .apply(Change::AddLearner(NodeId::new(9)))
+            .expect("a new server");
+
+        // The leader of term 1 adds a learner. The entry is in force here before it commits.
+        let change = Entry::new(Term::new(1), Payload::Config(grown.clone()));
+        let message = Message::AppendEntries {
+            term: Term::new(1),
+            prev_log_index: Index::ZERO,
+            prev_log_term: Term::new(0),
+            entries: vec![change],
+            leader_commit: Index::ZERO,
+            round: 0,
+        };
+        settle(
+            &mut node,
+            Input::Message {
+                from: NodeId::new(2),
+                message,
+            },
+        );
+        assert_eq!(node.membership(), &grown);
+
+        // It never commits. A leader of term 2 that did not have it overwrites it.
+        let message = Message::AppendEntries {
+            term: Term::new(2),
+            prev_log_index: Index::ZERO,
+            prev_log_term: Term::new(0),
+            entries: noops(2, 1),
+            leader_commit: Index::ZERO,
+            round: 0,
+        };
+        settle(
+            &mut node,
+            Input::Message {
+                from: NodeId::new(3),
+                message,
+            },
+        );
+        assert_eq!(node.membership(), &founding);
+    }
+
+    #[test]
+    fn the_membership_outlives_the_entry_that_set_it() {
+        let mut cluster = Cluster::new(3, None);
+        cluster.run(60);
+        let leader = cluster.leader();
+        let learner = cluster.add_joiner();
+        let id = cluster.nodes[learner].id();
+        cluster.feed(leader, Input::ChangeMembership(Change::AddLearner(id)));
+        cluster.run(4);
+        let membership = cluster.nodes[leader].membership().clone();
+
+        // Compaction drops the entry. The membership it set stays in force.
+        let committed = cluster.nodes[leader].commit_index();
+        cluster.feed(leader, Input::Compact { index: committed });
+        assert_eq!(cluster.nodes[leader].log(), []);
+        assert_eq!(cluster.nodes[leader].membership(), &membership);
+
+        // After a restart the log cannot say who is in the cluster. The state machine can, and
+        // without it the node would fall back to the members it was founded with.
+        let config = Config::new(NodeId::new(1), [NodeId::new(2), NodeId::new(3)], 1);
+        let base = cluster.nodes[leader].log_base();
+        let restart = |known: Option<Membership>| {
+            Raft::recover(
+                config.clone(),
+                HardState::default(),
+                base,
+                Vec::new(),
+                base,
+                known,
+            )
+            .expect("consistent storage")
+        };
+        assert_eq!(restart(Some(membership.clone())).membership(), &membership);
+        assert_eq!(restart(None).membership(), &config.founding_membership());
+    }
+
+    /// Votes are counted against this node's own membership. An answer from anyone else, however
+    /// willing, does not bring an election closer.
+    #[test]
+    fn only_voters_of_its_own_membership_can_elect_a_node() {
+        let mut node = follower(SnapshotMeta::default(), Vec::new(), SnapshotMeta::default());
+        let (member, stranger) = (NodeId::new(2), NodeId::new(9));
+        while node.role() == Role::Follower {
+            settle(&mut node, Input::Tick);
+        }
+        assert_eq!(node.role(), Role::PreCandidate);
+        let asked = node.term().get() + 1;
+
+        let pre_vote = Message::PreVoteResponse {
+            term: Term::new(asked),
+            granted: true,
+        };
+        settle(
+            &mut node,
+            Input::Message {
+                from: stranger,
+                message: pre_vote.clone(),
+            },
+        );
+        assert_eq!(
+            node.role(),
+            Role::PreCandidate,
+            "a stranger's pre-vote does not count"
+        );
+        settle(
+            &mut node,
+            Input::Message {
+                from: member,
+                message: pre_vote,
+            },
+        );
+        assert_eq!(node.role(), Role::Candidate);
+
+        let vote = Message::RequestVoteResponse {
+            term: node.term(),
+            granted: true,
+        };
+        settle(
+            &mut node,
+            Input::Message {
+                from: stranger,
+                message: vote.clone(),
+            },
+        );
+        assert_eq!(
+            node.role(),
+            Role::Candidate,
+            "a stranger's vote does not count"
+        );
+        settle(
+            &mut node,
+            Input::Message {
+                from: member,
+                message: vote,
+            },
+        );
+        assert_eq!(node.role(), Role::Leader);
     }
 }

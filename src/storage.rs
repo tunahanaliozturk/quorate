@@ -9,6 +9,7 @@ use std::path::Path;
 
 use katman::{Db, Options, SyncMode, WriteBatch};
 
+use crate::membership::Membership;
 use crate::types::{Entry, HardState, Index, NodeId, Payload, Persist, SnapshotMeta, Term};
 
 const HARD_STATE_KEY: &[u8] = b"h";
@@ -16,6 +17,7 @@ const BASE_KEY: &[u8] = b"b";
 const LOG_PREFIX: u8 = b'l';
 const KIND_NOOP: u8 = 0;
 const KIND_COMMAND: u8 = 1;
+const KIND_CONFIG: u8 = 2;
 
 /// Why storage could not be read or written.
 #[derive(Debug)]
@@ -232,17 +234,19 @@ pub(crate) fn decode_base(bytes: &[u8]) -> Result<SnapshotMeta, StorageError> {
 }
 
 fn encode_entry(entry: &Entry) -> Vec<u8> {
-    let command: &[u8] = match entry.payload() {
-        Payload::Noop => &[],
-        Payload::Command(command) => command,
+    let membership;
+    let (kind, body): (u8, &[u8]) = match entry.payload() {
+        Payload::Noop => (KIND_NOOP, &[]),
+        Payload::Command(command) => (KIND_COMMAND, command),
+        Payload::Config(members) => {
+            membership = members.encode();
+            (KIND_CONFIG, &membership)
+        }
     };
-    let mut bytes = Vec::with_capacity(9 + command.len());
+    let mut bytes = Vec::with_capacity(9 + body.len());
     bytes.extend_from_slice(&entry.term().get().to_be_bytes());
-    bytes.push(match entry.payload() {
-        Payload::Noop => KIND_NOOP,
-        Payload::Command(_) => KIND_COMMAND,
-    });
-    bytes.extend_from_slice(command);
+    bytes.push(kind);
+    bytes.extend_from_slice(body);
     bytes
 }
 
@@ -257,6 +261,10 @@ fn decode_entry(bytes: &[u8]) -> Result<Entry, StorageError> {
     let payload = match kind {
         KIND_NOOP if command.is_empty() => Payload::Noop,
         KIND_COMMAND => Payload::Command(command.to_vec()),
+        KIND_CONFIG => match Membership::decode(command) {
+            Some(members) => Payload::Config(members),
+            None => return Err(corrupt),
+        },
         _ => return Err(corrupt),
     };
     Ok(Entry::new(Term::new(u64::from_be_bytes(*term)), payload))
@@ -267,6 +275,7 @@ mod tests {
     use katman::{Options, SimFs, Torn};
 
     use super::{Recovered, Storage};
+    use crate::membership::Membership;
     use crate::types::{
         Entry, HardState, Index, LogWrite, NodeId, Payload, Persist, PersistSeq, SnapshotMeta, Term,
     };
@@ -359,6 +368,19 @@ mod tests {
             reopen(&mut fs, storage).log,
             vec![entry(1, b"a"), entry(2, b"x"), entry(2, b"y")]
         );
+    }
+
+    #[test]
+    fn a_membership_entry_survives_a_power_cut() {
+        let mut fs = SimFs::new();
+        let mut storage = open(&fs).storage;
+        let voters = [1, 2, 3].map(NodeId::new);
+        let members = Membership::new(voters, [NodeId::new(4)]);
+        let log = vec![Entry::new(Term::new(1), Payload::Config(members))];
+        storage
+            .persist(&request(1, None, None, Some((1, log.clone()))))
+            .expect("write succeeds");
+        assert_eq!(reopen(&mut fs, storage).log, log);
     }
 
     #[test]

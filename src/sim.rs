@@ -16,6 +16,8 @@
 //!   filesystem, which drops unsynced bytes on a power cut. It restarts later from what they hold.
 //! - Logs are compacted: every few applied entries a node forces its state machine to disk and
 //!   drops the log before it. A follower that falls behind the leader's log gets a snapshot.
+//! - The membership changes: two spare nodes run from the start, and at random moments one
+//!   joins as a learner, a learner is promoted or dropped, or a voter is removed.
 //! - Clients lose requests and replies, give up waiting and send the same request to another
 //!   node, and now and then send an old request again. Most gets are served by the leader
 //!   without a log entry; the rest go through the log.
@@ -36,11 +38,12 @@ use katman::{Options, SimFs, Torn};
 use crate::Config;
 use crate::kv::{Op, Reply, Request, SessionId};
 use crate::linearizability::{Call, Operation, Return, linearizable};
+use crate::membership::{Change, Membership};
 use crate::raft::{Bug, Raft, Role};
 use crate::rng::Rng;
 use crate::state::{Outcome, Snapshot, StateMachine};
 use crate::storage::{Recovered, Storage};
-use crate::types::{Entry, Index, Input, Message, NodeId, Output, Persist, ReadId, Term};
+use crate::types::{Entry, Index, Input, Message, NodeId, Output, Payload, Persist, ReadId, Term};
 
 /// Keys the clients work on. Few, so that their operations collide.
 const KEYS: usize = 2;
@@ -113,6 +116,8 @@ pub(crate) struct Totals {
     pub(crate) operations: usize,
     /// Snapshots that replaced a follower's state machine.
     pub(crate) snapshots: usize,
+    /// Membership changes that committed.
+    pub(crate) changes: usize,
 }
 
 /// The parts of a node that a power cut destroys.
@@ -184,6 +189,10 @@ pub(crate) struct Sim {
     /// behind.
     retain: u64,
     snapshots: usize,
+    /// How many nodes the cluster is founded with. The nodes after them start outside it.
+    founders: usize,
+    /// Whether the run changes the membership at random.
+    reshuffle: bool,
     /// The first leader seen in each term.
     leaders: HashMap<Term, usize>,
     /// Every entry any node has applied, by position.
@@ -241,16 +250,44 @@ fn returned(reply: &Reply) -> Return {
 
 impl Sim {
     pub(crate) fn new(seed: u64, bug: Option<Bug>) -> Self {
+        Self::build(seed, bug, Some(2), None)
+    }
+
+    /// A cluster with one spare node for every founder, no partitions and no power cuts, for
+    /// the run that replaces every node.
+    pub(crate) fn for_replacement(seed: u64) -> Self {
+        // Full batches. With one entry per message a leader sends an entry, waits for the
+        // answer and only then sends the next, and under clients that never pause its log grows
+        // faster than it commits. A membership change then waits behind a backlog that never
+        // clears. The random runs are short enough not to mind; this one is not.
+        let mut sim = Self::build(seed, None, None, Some(64));
+        sim.crash_per_mille = 0;
+        sim.reshuffle = false;
+        sim
+    }
+
+    /// `spares` nodes run from the start without being members, to be added later. `None` means
+    /// as many as there are founders.
+    fn build(seed: u64, bug: Option<Bug>, spares: Option<usize>, batch: Option<usize>) -> Self {
         let mut rng = Rng::new(seed);
-        let size = if rng.below(2) == 0 { 3 } else { 5 };
+        let founders = if rng.below(2) == 0 { 3 } else { 5 };
+        let size = founders + spares.unwrap_or(founders);
         // A batch of one makes followers catch up an entry at a time, which is where most of the
         // interesting partial states come from.
         let max_batch = [1, 2, 64][to_usize(rng.below(3))];
+        let max_batch = batch.unwrap_or(max_batch);
         let nodes = (0..size)
             .map(|position| {
-                let peers = (0..size).filter(|&other| other != position).map(node_id);
+                let config = if position < founders {
+                    let peers = (0..founders)
+                        .filter(|&other| other != position)
+                        .map(node_id);
+                    Config::new(node_id(position), peers, 0)
+                } else {
+                    Config::joining(node_id(position), 0)
+                };
                 Node {
-                    config: Config::new(node_id(position), peers, 0).max_batch(max_batch),
+                    config: config.max_batch(max_batch),
                     fs: SimFs::new(),
                     live: None,
                     restart_at: 0,
@@ -282,6 +319,8 @@ impl Sim {
             compact_every: [8, 32, 128][to_usize(rng.below(3))],
             retain: [0, 4][to_usize(rng.below(2))],
             snapshots: 0,
+            founders,
+            reshuffle: true,
             leaders: HashMap::new(),
             committed: Vec::new(),
             next_command: 0,
@@ -325,17 +364,16 @@ impl Sim {
             if self.chance(10) {
                 self.propose_junk()?;
             }
+            if self.reshuffle && self.chance(2) {
+                self.change_membership_at_random()?;
+            }
             if self.now.is_multiple_of(32) {
                 self.check_logs()?;
             }
         }
         self.check_logs()?;
         self.settle()?;
-        Ok(Totals {
-            committed: self.committed.len(),
-            operations: self.histories.iter().map(Vec::len).sum(),
-            snapshots: self.snapshots,
-        })
+        Ok(self.totals())
     }
 
     fn chance(&mut self, percent: u64) -> bool {
@@ -376,9 +414,19 @@ impl Sim {
             .expect("the state machine opens after any crash");
         // A new seed each time, or a node would repeat the election timeouts of its last life.
         slot.config.seed = self.rng.next_u64();
-        let Ok(mut raft) =
-            Raft::recover(slot.config.clone(), hard_state, base, log, state.applied())
-        else {
+        state
+            .bootstrap(&slot.config.founding_membership())
+            .expect("the simulated disk does not fail");
+        let membership = state.membership().cloned();
+        let recovered = Raft::recover(
+            slot.config.clone(),
+            hard_state,
+            base,
+            log,
+            state.applied(),
+            membership,
+        );
+        let Ok(mut raft) = recovered else {
             return Err(Violation::StateLost { node });
         };
         if let Some(bug) = self.bug {
@@ -512,7 +560,7 @@ impl Sim {
                     }
                 }
                 Output::ReadRejected { id, .. } => self.read_rejected(id),
-                Output::NotLeader { .. } => {}
+                Output::NotLeader { .. } | Output::ChangeRejected { .. } => {}
             }
         }
         self.serve_reads(node);
@@ -611,6 +659,7 @@ impl Sim {
                 term,
                 round,
                 snapshot: snapshot.meta(),
+                membership: snapshot.membership().cloned().unwrap_or_default(),
             },
         )?;
         // The worst moment for the power to go: the state machine holds the snapshot, and the
@@ -652,6 +701,132 @@ impl Sim {
             node,
             Input::Propose(self.next_command.to_be_bytes().to_vec()),
         )
+    }
+
+    // ---- Membership. ----
+
+    /// The leader of the highest term, by position.
+    fn leader(&self) -> Option<usize> {
+        let leaders = self.up().filter(|(_, raft)| raft.role() == Role::Leader);
+        leaders
+            .max_by_key(|(_, raft)| raft.term())
+            .map(|(node, _)| node)
+    }
+
+    /// The members according to that leader, by position.
+    fn members(&self) -> Option<Vec<usize>> {
+        let raft = self.raft(self.leader()?)?;
+        Some(raft.membership().members().map(position_of).collect())
+    }
+
+    /// Asks some node that believes it leads for a random change that fits its membership: a
+    /// spare joins as a learner, a learner is promoted or dropped, a voter is removed. The
+    /// cluster never goes below three voters.
+    fn change_membership_at_random(&mut self) -> Result<(), Violation> {
+        let leaders = self.leaders();
+        if leaders.is_empty() {
+            return Ok(());
+        }
+        let leader = leaders[self.pick(leaders.len())];
+        let Some(membership) = self.raft(leader).map(|raft| raft.membership().clone()) else {
+            return Ok(());
+        };
+        let outsiders: Vec<NodeId> = (0..self.nodes.len())
+            .map(node_id)
+            .filter(|&id| !membership.contains(id))
+            .collect();
+        let mut changes = Vec::new();
+        if !outsiders.is_empty() {
+            changes.push(Change::AddLearner(outsiders[self.pick(outsiders.len())]));
+        }
+        if !membership.learners().is_empty() {
+            let learner = membership.learners()[self.pick(membership.learners().len())];
+            changes.extend([
+                Change::Promote(learner),
+                Change::Promote(learner),
+                Change::Remove(learner),
+            ]);
+        }
+        if membership.voters().len() > 3 {
+            changes.push(Change::Remove(
+                membership.voters()[self.pick(membership.voters().len())],
+            ));
+        }
+        if changes.is_empty() {
+            return Ok(());
+        }
+        let change = changes[self.pick(changes.len())];
+        self.step(leader, Input::ChangeMembership(change))
+    }
+
+    /// Replaces every founding node with a spare, one step at a time, while the clients keep
+    /// working: the spare joins as a learner, is promoted, and the founder is removed. At the end
+    /// the cluster consists of nodes that were not there at the start, and the usual checks say
+    /// whether anything was lost on the way.
+    pub(crate) fn run_replacement(mut self) -> Result<Totals, Violation> {
+        for old in 0..self.founders {
+            let (old, new) = (node_id(old), node_id(self.founders + old));
+            self.change_until(Change::AddLearner(new), |members| members.contains(new))?;
+            self.change_until(Change::Promote(new), |members| members.is_voter(new))?;
+            self.change_until(Change::Remove(old), |members| !members.contains(old))?;
+        }
+        self.check_logs()?;
+        self.settle()?;
+        let expected: Vec<usize> = (self.founders..2 * self.founders).collect();
+        if self.members() != Some(expected) {
+            return Err(Violation::Liveness {
+                reason: "the cluster did not end up with the new nodes",
+            });
+        }
+        Ok(self.totals())
+    }
+
+    /// Keeps asking the leader for `change` until its state machine shows it. The leader refuses
+    /// while an earlier change is uncommitted or a learner is behind, and leaders come and go, so
+    /// this takes a few tries.
+    fn change_until(
+        &mut self,
+        change: Change,
+        done: impl Fn(&Membership) -> bool,
+    ) -> Result<(), Violation> {
+        for tick in 0..5_000_u64 {
+            self.advance()?;
+            if self.now.is_multiple_of(32) {
+                self.check_logs()?;
+            }
+            if !tick.is_multiple_of(10) {
+                continue;
+            }
+            let Some(leader) = self.leader() else {
+                continue;
+            };
+            // Applied, not merely in the leader's log: an entry that has not committed can still
+            // be overwritten when the leader changes, and the change would be gone again.
+            let applied = self.nodes[leader]
+                .live
+                .as_ref()
+                .and_then(|live| live.state.membership());
+            if applied.is_some_and(&done) {
+                return Ok(());
+            }
+            self.step(leader, Input::ChangeMembership(change))?;
+        }
+        Err(Violation::Liveness {
+            reason: "a membership change did not go through",
+        })
+    }
+
+    fn totals(&self) -> Totals {
+        Totals {
+            committed: self.committed.len(),
+            operations: self.histories.iter().map(Vec::len).sum(),
+            snapshots: self.snapshots,
+            changes: self
+                .committed
+                .iter()
+                .filter(|entry| matches!(entry.payload(), Payload::Config(_)))
+                .count(),
+        }
     }
 
     // ---- Clients. ----
@@ -997,15 +1172,28 @@ impl Sim {
         Ok(())
     }
 
-    /// Whether every node is up and holds the whole committed log and nothing else, and no
-    /// client is still waiting.
+    /// Whether every member holds the whole committed log and nothing else, and no client is
+    /// still waiting.
     fn quiet(&self) -> bool {
         let length = to_u64(self.committed.len());
-        self.up().count() == self.nodes.len()
-            && self.clients.iter().all(|client| client.waiting.is_none())
-            && self.up().all(|(_, raft)| {
-                raft.last_log_index().get() == length && raft.commit_index().get() == length
+        let Some(members) = self.members() else {
+            return false;
+        };
+        // Applied as well as committed: a node whose disk is still writing knows that an entry
+        // is committed before it may apply it.
+        let settled = |node: usize| {
+            self.raft(node).is_some_and(|raft| {
+                [
+                    raft.last_log_index(),
+                    raft.commit_index(),
+                    raft.applied_index(),
+                ]
+                .iter()
+                .all(|index| index.get() == length)
             })
+        };
+        self.clients.iter().all(|client| client.waiting.is_none())
+            && members.into_iter().all(settled)
     }
 
     /// Advances until the cluster is quiet, for at most `budget` ticks.
@@ -1066,10 +1254,13 @@ impl Sim {
         if let Some(key) = (0..KEYS).find(|&key| !linearizable(&self.histories[key])) {
             return Err(Violation::NotLinearizable { key });
         }
-        let dump = |node: &Node| node.live.as_ref().map(|live| live.state.dump());
-        let reference = self.nodes.first().and_then(dump);
-        match (1..size).find(|&node| dump(&self.nodes[node]) != reference) {
-            Some(node) => Err(Violation::StateDiverged { node }),
+        // Only the members are compared. A node that was removed, or never added, stopped
+        // receiving the log at some point and is not expected to keep up.
+        let members = self.members().unwrap_or_default();
+        let dump = |node: usize| self.nodes[node].live.as_ref().map(|live| live.state.dump());
+        let reference = members.first().and_then(|&node| dump(node));
+        match members.iter().find(|&&node| dump(node) != reference) {
+            Some(&node) => Err(Violation::StateDiverged { node }),
             None => Ok(()),
         }
     }
@@ -1115,6 +1306,7 @@ mod tests {
         let failures = Mutex::new(Vec::new());
         let operations = AtomicU64::new(0);
         let snapshots = AtomicU64::new(0);
+        let changes = AtomicU64::new(0);
         let workers = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
 
         std::thread::scope(|scope| {
@@ -1131,6 +1323,7 @@ mod tests {
                                     .fetch_add(super::to_u64(totals.operations), Ordering::Relaxed);
                                 snapshots
                                     .fetch_add(super::to_u64(totals.snapshots), Ordering::Relaxed);
+                                changes.fetch_add(super::to_u64(totals.changes), Ordering::Relaxed);
                             }
                             Err(violation) => failures
                                 .lock()
@@ -1150,10 +1343,11 @@ mod tests {
         );
         // A run in which no client got an answer would pass every check without testing anything.
         assert!(operations.load(Ordering::Relaxed) > 0);
-        // Nor would the snapshot path be tested if no follower ever needed one. A single seed
+        // Nor would snapshots or membership changes be tested if none ever happened. A single seed
         // may well not; a hundred do.
         if range.end - range.start >= 100 {
             assert!(snapshots.load(Ordering::Relaxed) > 0);
+            assert!(changes.load(Ordering::Relaxed) > 0);
         }
     }
 
@@ -1212,6 +1406,27 @@ mod tests {
             matches!(found, Some((_, Violation::StateLost { .. }))),
             "expected a node that lost its state, got {found:?}"
         );
+    }
+
+    #[test]
+    fn accepting_a_membership_change_while_another_is_in_flight_is_caught() {
+        let found = first_safety_violation(Bug::ChangeWhileInProgress, 1_000);
+        assert!(
+            found.is_some(),
+            "no seed below 1,000 exposed two membership changes in flight"
+        );
+    }
+
+    #[test]
+    fn every_node_can_be_replaced_one_by_one_and_nothing_is_lost() {
+        let mut operations = 0;
+        for seed in 0..env("QUORATE_REPLACEMENTS").unwrap_or(1_000) {
+            match Sim::for_replacement(seed).run_replacement() {
+                Ok(totals) => operations += totals.operations,
+                Err(violation) => panic!("seed {seed}: {violation:?}"),
+            }
+        }
+        assert!(operations > 0);
     }
 
     #[test]

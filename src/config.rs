@@ -2,13 +2,15 @@
 
 use core::fmt;
 
+use crate::membership::Membership;
 use crate::types::NodeId;
 
-/// How one node is set up. Membership is fixed for the life of the node.
+/// How one node is set up.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub(crate) id: NodeId,
     pub(crate) peers: Vec<NodeId>,
+    pub(crate) joining: bool,
     pub(crate) seed: u64,
     pub(crate) election_ticks: u32,
     pub(crate) heartbeat_ticks: u32,
@@ -19,16 +21,39 @@ impl Config {
     /// A configuration with default timing: an election timeout of 10 to 19 ticks, a heartbeat
     /// every 2 ticks and at most 64 entries per message.
     ///
-    /// `peers` are the other nodes. `seed` drives the randomised election timeout; give every node
-    /// a different one.
+    /// The node is a founding member: it and `peers` are the voters the cluster starts with.
+    /// `seed` drives the randomised election timeout; give every node a different one.
     pub fn new(id: NodeId, peers: impl IntoIterator<Item = NodeId>, seed: u64) -> Self {
         Self {
             id,
             peers: peers.into_iter().collect(),
+            joining: false,
             seed,
             election_ticks: 10,
             heartbeat_ticks: 2,
             max_batch: 64,
+        }
+    }
+
+    /// A configuration for a node that joins a cluster which already exists. It knows of no
+    /// members and never starts an election. It learns the membership from the leader, once the
+    /// leader has been told to add it.
+    #[must_use]
+    pub fn joining(id: NodeId, seed: u64) -> Self {
+        Self {
+            joining: true,
+            ..Self::new(id, [], seed)
+        }
+    }
+
+    /// The membership the node starts from when its storage holds none: the founding voters, or
+    /// nobody for a node that joins.
+    #[must_use]
+    pub fn founding_membership(&self) -> Membership {
+        if self.joining {
+            Membership::default()
+        } else {
+            Membership::new(self.peers.iter().copied().chain([self.id]), [])
         }
     }
 

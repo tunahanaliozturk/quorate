@@ -39,6 +39,7 @@ mod kv;
 #[cfg(test)]
 mod linearizability;
 mod log;
+mod membership;
 mod raft;
 mod rng;
 #[cfg(test)]
@@ -49,6 +50,7 @@ mod types;
 
 pub use config::{Config, ConfigError};
 pub use kv::{Op, Reply, Request, SessionId};
+pub use membership::{Change, ChangeError, Membership};
 pub use raft::{Raft, Role};
 pub use state::{Outcome, Snapshot, StateMachine};
 pub use storage::{Recovered, Storage, StorageError};

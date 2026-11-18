@@ -1,5 +1,7 @@
 //! Identifiers, log entries and the messages nodes exchange.
 
+use crate::membership::{Change, ChangeError, Membership};
+
 /// Identifies one node in the cluster.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(u64);
@@ -77,6 +79,9 @@ pub enum Payload {
     Noop,
     /// A client command. The core never looks inside.
     Command(Vec<u8>),
+    /// A new membership. It is in force on a node from the moment the entry is in its log, not
+    /// from the moment it commits.
+    Config(Membership),
 }
 
 /// One entry in the replicated log.
@@ -401,6 +406,8 @@ pub enum Input {
         /// Chosen by the driver, to match the answer to the read.
         id: ReadId,
     },
+    /// Someone wants the membership changed by one step. Only the leader acts on it.
+    ChangeMembership(Change),
     /// The state machine holds everything up to `index` durably, so the log before it may go.
     /// The node never drops entries it has not handed out with [`Output::Apply`].
     Compact {
@@ -419,6 +426,9 @@ pub enum Input {
         round: u64,
         /// The point the snapshot covers.
         snapshot: SnapshotMeta,
+        /// The membership at that point, as the snapshot recorded it. Empty if the snapshot holds
+        /// none, which leaves the node's membership as it was.
+        membership: Membership,
     },
     /// The [`Persist`] request with this number, and every earlier one, is on stable storage.
     Persisted {
@@ -476,7 +486,14 @@ pub enum Output {
         /// The leader this node last heard from, if any.
         leader: Option<NodeId>,
     },
-    /// A proposal was refused because this node is not the leader.
+    /// The leader refused a membership change.
+    ChangeRejected {
+        /// The change that was asked for.
+        change: Change,
+        /// Why not.
+        reason: ChangeError,
+    },
+    /// A proposal or a membership change was refused because this node is not the leader.
     NotLeader {
         /// The leader this node last heard from, if any.
         leader: Option<NodeId>,

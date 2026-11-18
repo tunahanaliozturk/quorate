@@ -7,6 +7,7 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 - Repository scaffold, design document and roadmap.
 - Raft core as a pure state machine: leader election, log replication, a no-op entry on election and a conflict hint for fast log back-up. State is in memory only.
 - Durability: the core issues write requests and holds messages until they are reported durable. `Storage` keeps the term, vote and log in a katman database.
+- Membership changes one server at a time: `Membership`, `Change`, `Input::ChangeMembership`, learners, `Config::joining` for a node that joins an existing cluster. The state machine records the membership and snapshots carry it.
 - Log compaction and snapshots: `Input::Compact`, `Output::SendSnapshot`, `Input::Snapshot`; `StateMachine::checkpoint`, `snapshot` and `install`; storage removes the entries before a new log base.
 - A restarting node whose log disagrees with its state machine starts its log over.
 - A step-by-step test of figure 8 of the Raft paper, and a weekly job that runs 200,000 simulator seeds.

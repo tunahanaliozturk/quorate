@@ -13,10 +13,12 @@ use std::path::Path;
 use katman::{Db, Options, SyncMode, WriteBatch};
 
 use crate::kv::{Op, Reply, Request, SessionId};
+use crate::membership::Membership;
 use crate::storage::{StorageError, decode_base, encode_base};
 use crate::types::{Entry, Index, Payload, SnapshotMeta};
 
 const APPLIED_KEY: &[u8] = b"a";
+const MEMBERSHIP_KEY: &[u8] = b"c";
 const DATA_PREFIX: u8 = b'd';
 const SESSION_PREFIX: u8 = b's';
 
@@ -35,6 +37,7 @@ pub struct Outcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
     meta: SnapshotMeta,
+    membership: Option<Membership>,
     rows: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
@@ -44,6 +47,12 @@ impl Snapshot {
     pub const fn meta(&self) -> SnapshotMeta {
         self.meta
     }
+
+    /// The membership at that point, if the state machine it was taken from knew one.
+    #[must_use]
+    pub const fn membership(&self) -> Option<&Membership> {
+        self.membership.as_ref()
+    }
 }
 
 /// One node's copy of the key-value store.
@@ -52,6 +61,8 @@ pub struct StateMachine {
     db: Db,
     /// The last entry applied: its index and its term.
     applied: SnapshotMeta,
+    /// The membership as of the last entry applied, once one is known.
+    membership: Option<Membership>,
     #[cfg(test)]
     apply_retries_again: bool,
 }
@@ -73,9 +84,17 @@ impl StateMachine {
             None => SnapshotMeta::default(),
             Some(bytes) => decode_base(&bytes)?,
         };
+        let membership = match db.get(MEMBERSHIP_KEY)? {
+            None => None,
+            Some(bytes) => match Membership::decode(&bytes) {
+                Some(members) => Some(members),
+                None => return Err(StorageError::Corrupt("the membership has the wrong shape")),
+            },
+        };
         Ok(Self {
             db,
             applied,
+            membership,
             #[cfg(test)]
             apply_retries_again: false,
         })
@@ -92,6 +111,29 @@ impl StateMachine {
     #[must_use]
     pub const fn applied(&self) -> SnapshotMeta {
         self.applied
+    }
+
+    /// The membership as of the last entry applied. `None` on a node that joined and has not
+    /// applied a membership entry or installed a snapshot yet.
+    #[must_use]
+    pub const fn membership(&self) -> Option<&Membership> {
+        self.membership.as_ref()
+    }
+
+    /// Records the membership a founding node starts with, if the state machine knows none yet.
+    /// It travels in snapshots from then on, which is how a node that joins later learns who is
+    /// in the cluster when it is caught up by snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Db`] when the write fails.
+    pub fn bootstrap(&mut self, founding: &Membership) -> Result<(), StorageError> {
+        if self.membership.is_some() || founding.voters().is_empty() {
+            return Ok(());
+        }
+        self.db.put(MEMBERSHIP_KEY, founding.encode())?;
+        self.membership = Some(founding.clone());
+        Ok(())
     }
 
     /// Forces everything applied so far to disk and returns the position that is now durable.
@@ -118,6 +160,7 @@ impl StateMachine {
         let rows = self.db.iter().collect::<Result<Vec<_>, _>>()?;
         Ok(Snapshot {
             meta: self.applied,
+            membership: self.membership.clone(),
             rows,
         })
     }
@@ -148,6 +191,7 @@ impl StateMachine {
         self.db.write(batch)?;
         self.db.flush()?;
         self.applied = snapshot.meta;
+        self.membership.clone_from(&snapshot.membership);
         Ok(true)
     }
 
@@ -186,6 +230,10 @@ impl StateMachine {
         // the stores stay identical.
         let request = match entry.payload() {
             Payload::Command(command) => Request::decode(command),
+            Payload::Config(members) => {
+                batch.put(MEMBERSHIP_KEY, members.encode());
+                None
+            }
             Payload::Noop => None,
         };
         let outcome = match request {
@@ -194,6 +242,9 @@ impl StateMachine {
         };
         self.db.write(batch)?;
         self.applied = applied;
+        if let Payload::Config(members) = entry.payload() {
+            self.membership = Some(members.clone());
+        }
         Ok(outcome)
     }
 
@@ -304,7 +355,8 @@ mod tests {
 
     use super::StateMachine;
     use crate::kv::{Op, Reply, Request, SessionId};
-    use crate::types::{Entry, Index, Payload, Term};
+    use crate::membership::Membership;
+    use crate::types::{Entry, Index, NodeId, Payload, Term};
 
     fn open(fs: &SimFs) -> StateMachine {
         StateMachine::open("state", Options::default().with_sim_fs(fs.clone()))
@@ -484,6 +536,31 @@ mod tests {
             .apply(Index::new(4), &entry(2, 1, put(b"b")))
             .expect("apply succeeds");
         assert_eq!(retry.map(|outcome| outcome.reply), Some(Reply::Done));
+    }
+
+    #[test]
+    fn the_membership_is_applied_like_any_entry_and_travels_in_a_snapshot() {
+        let founding = Membership::new([1, 2, 3].map(NodeId::new), []);
+        let grown = Membership::new([1, 2, 3].map(NodeId::new), [NodeId::new(4)]);
+
+        let mut source = open(&SimFs::new());
+        source.bootstrap(&founding).expect("the write succeeds");
+        assert_eq!(source.membership(), Some(&founding));
+        let change = Entry::new(Term::new(1), Payload::Config(grown.clone()));
+        run(&mut source, &[entry(1, 1, put(b"a")), change]);
+        assert_eq!(source.membership(), Some(&grown));
+
+        // A node that joined knows nobody until the snapshot tells it.
+        let fs = SimFs::new();
+        let mut joiner = open(&fs);
+        assert_eq!(joiner.membership(), None);
+        let snapshot = source.snapshot().expect("the snapshot is read");
+        assert_eq!(snapshot.membership(), Some(&grown));
+        assert!(joiner.install(&snapshot).expect("the install succeeds"));
+
+        let fs = fs.power_loss(Torn::Nothing);
+        drop(joiner);
+        assert_eq!(open(&fs).membership(), Some(&grown));
     }
 
     #[test]
