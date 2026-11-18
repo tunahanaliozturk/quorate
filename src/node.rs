@@ -218,6 +218,10 @@ impl Node {
         let mut inputs = VecDeque::new();
         for event in events {
             self.take_in(event, &mut inputs, &mut effects)?;
+            // Before the next event is looked at: a request is accepted or turned away by what
+            // this node is now, and an earlier event in the same batch may have deposed it.
+            // Only the writes wait for the whole batch.
+            self.step_all(&mut inputs, &mut effects)?;
         }
         self.work_off(&mut inputs, &mut effects)?;
 
@@ -283,14 +287,7 @@ impl Node {
         effects: &mut Vec<Effect>,
     ) -> Result<(), NodeError> {
         loop {
-            // One input at a time, each to the end, before the next.
-            while let Some(input) = inputs.pop_front() {
-                for output in self.raft.step(input) {
-                    self.carry_out(output, effects)?;
-                }
-                self.serve_reads(effects)?;
-                self.maybe_compact(inputs)?;
-            }
+            self.step_all(inputs, effects)?;
             // The core has seen everything there is, and has asked for some writes on the way.
             // They go to disk together. Only then is it told, and that may set it going again:
             // messages it was holding back are released, entries become ready to apply.
@@ -302,6 +299,23 @@ impl Node {
             self.unwritten.clear();
             inputs.push_back(Input::Persisted { seq });
         }
+    }
+
+    /// Feeds the core its inputs, one at a time, each to the end, before the next. Nothing is
+    /// written to disk here.
+    fn step_all(
+        &mut self,
+        inputs: &mut VecDeque<Input>,
+        effects: &mut Vec<Effect>,
+    ) -> Result<(), NodeError> {
+        while let Some(input) = inputs.pop_front() {
+            for output in self.raft.step(input) {
+                self.carry_out(output, effects)?;
+            }
+            self.serve_reads(effects)?;
+            self.maybe_compact(inputs)?;
+        }
+        Ok(())
     }
 
     /// Takes a client's request, or says straight away that this is the wrong node.
@@ -412,8 +426,8 @@ impl Node {
                     });
                 }
             }
-            // Requests are not handed to a core that does not lead, so this names nothing a
-            // client is waiting for.
+            // A request is handed to the core straight after the check that this node leads,
+            // with no other input in between, so this names nothing a client is waiting for.
             Output::NotLeader { .. } => {}
         }
         Ok(())
@@ -471,8 +485,8 @@ mod tests {
     use crate::kv::{Op, Reply, Request, SessionId};
     use crate::membership::{Change, ChangeError};
     use crate::raft::Role;
-    use crate::types::NodeId;
-    use crate::wire::{ClientRequest, ClientResponse};
+    use crate::types::{AppendOutcome, Index, Message, NodeId, Term};
+    use crate::wire::{ClientRequest, ClientResponse, PeerFrame};
 
     /// Three nodes with an instant network. A node that is down receives nothing.
     struct Cluster {
@@ -725,5 +739,61 @@ mod tests {
                 leader: Some(id(leader))
             }]
         );
+    }
+
+    #[test]
+    fn a_request_that_arrives_together_with_news_of_a_newer_term_is_turned_away() {
+        let mut cluster = Cluster::new(Compaction::default());
+        cluster.run(60);
+        let leader = cluster.leader();
+        let follower = (leader + 1) % 3;
+        let newer = Message::AppendEntriesResponse {
+            term: Term::new(1_000),
+            outcome: AppendOutcome::Accepted {
+                match_index: Index::new(0),
+            },
+            round: 0,
+        };
+        let write = Request::new(SessionId::new(7), 1, put(b"k", b"v"));
+
+        // One batch: by the time the requests are looked at, the node no longer leads. Checked
+        // against what it was when the batch arrived, the write would wait for an answer that
+        // never comes and the change would be reported as accepted.
+        let node = cluster.nodes[leader].as_mut().expect("up");
+        let effects = node
+            .handle_all([
+                Event::Peer {
+                    from: id(follower),
+                    frame: PeerFrame::Message(newer),
+                },
+                Event::Client {
+                    conn: 1,
+                    request: ClientRequest::Op(write),
+                },
+                Event::Client {
+                    conn: 2,
+                    request: ClientRequest::Change(Change::AddLearner(NodeId::new(4))),
+                },
+            ])
+            .expect("a healthy node");
+        let answers: Vec<_> = effects
+            .into_iter()
+            .filter_map(|effect| match effect {
+                Effect::ToClient { conn, response } => Some((conn, response)),
+                Effect::ToPeer { .. } => None,
+            })
+            .collect();
+
+        assert!(
+            matches!(
+                answers.as_slice(),
+                [
+                    (1, ClientResponse::NotLeader { .. }),
+                    (2, ClientResponse::NotLeader { .. })
+                ]
+            ),
+            "{answers:?}"
+        );
+        assert!(node.proposals.is_empty());
     }
 }
