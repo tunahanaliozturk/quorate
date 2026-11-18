@@ -2233,8 +2233,8 @@ mod tests {
 
         // With both voters gone, the leader and the learner are two of four, and no majority of
         // three. Nothing commits.
-        for node in 0..3 {
-            cluster.cut_off[node] = node != leader;
+        for (node, cut_off) in cluster.cut_off.iter_mut().enumerate().take(3) {
+            *cut_off = node != leader;
         }
         let committed = cluster.nodes[leader].commit_index();
         cluster.feed(leader, Input::Propose(b"stuck".to_vec()));
@@ -2282,8 +2282,8 @@ mod tests {
         let (first, second) = (cluster.nodes[first].id(), cluster.nodes[second].id());
 
         // Nobody can acknowledge, so the first change stays uncommitted.
-        for node in 0..3 {
-            cluster.cut_off[node] = node != leader;
+        for (node, cut_off) in cluster.cut_off.iter_mut().enumerate().take(3) {
+            *cut_off = node != leader;
         }
         cluster.feed(leader, Input::ChangeMembership(Change::AddLearner(first)));
         assert_eq!(
