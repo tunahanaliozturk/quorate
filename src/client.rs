@@ -16,7 +16,9 @@ use std::time::Instant;
 use crate::kv::{Op, Reply, Request, SessionId};
 use crate::membership::{Change, ChangeError};
 use crate::types::NodeId;
-use crate::wire::{ClientRequest, ClientResponse, Hello, Status, read_frame, write_frame};
+use crate::wire::{
+    CLIENT_FRAME, ClientRequest, ClientResponse, Hello, Status, read_frame, write_frame,
+};
 
 /// Why a request did not get an answer.
 #[derive(Debug)]
@@ -264,5 +266,6 @@ impl Client {
 
 fn exchange(stream: &mut TcpStream, request: &ClientRequest) -> io::Result<ClientResponse> {
     write_frame(stream, &request.encode())?;
-    ClientResponse::decode(&read_frame(stream)?).ok_or_else(|| io::ErrorKind::InvalidData.into())
+    ClientResponse::decode(&read_frame(stream, CLIENT_FRAME)?)
+        .ok_or_else(|| io::ErrorKind::InvalidData.into())
 }

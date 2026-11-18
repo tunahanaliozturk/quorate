@@ -23,9 +23,14 @@ use crate::types::{AppendOutcome, Index, Message, NodeId, Term};
 const MAGIC: [u8; 2] = *b"QR";
 /// Bumped when the format changes in a way an older node would misread.
 const VERSION: u8 = 1;
-/// No frame is larger than this. A snapshot is one frame, so this also bounds the store a
-/// snapshot can carry.
-const MAX_FRAME: usize = 64 << 20;
+/// The largest frame one node sends another. A snapshot is one frame, so this also bounds the
+/// store a snapshot can carry.
+pub(crate) const PEER_FRAME: usize = 64 << 20;
+/// The largest frame to or from a client: one request or one response, so one key and value.
+/// Anyone can open a client connection, which is why this is much smaller.
+pub(crate) const CLIENT_FRAME: usize = 8 << 20;
+/// The largest first frame of a connection. It only says who is calling.
+pub(crate) const HELLO_FRAME: usize = 64;
 
 fn invalid(what: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, what)
@@ -37,7 +42,7 @@ fn invalid(what: &'static str) -> io::Error {
 ///
 /// Returns the writer's error, or `InvalidData` for a payload over the frame limit.
 pub(crate) fn write_frame(writer: &mut impl Write, payload: &[u8]) -> io::Result<()> {
-    if payload.len() > MAX_FRAME {
+    if payload.len() > PEER_FRAME {
         return Err(invalid("the frame is too large to send"));
     }
     let length =
@@ -50,26 +55,33 @@ pub(crate) fn write_frame(writer: &mut impl Write, payload: &[u8]) -> io::Result
     writer.flush()
 }
 
-/// Reads one frame and checks it.
+/// Reads one frame of at most `limit` bytes and checks it.
+///
+/// The length in the header is a claim by whoever is on the other end. It is checked against
+/// `limit` before anything else, and even then memory is taken only as the bytes arrive: a
+/// connection that announces a large frame and sends nothing costs nothing.
 ///
 /// # Errors
 ///
 /// Returns the reader's error (`UnexpectedEof` when the other side hung up), or `InvalidData`
-/// for a frame that claims to be too large or does not match its checksum. After `InvalidData`
-/// the stream is out of step and has to be closed.
-pub(crate) fn read_frame(reader: &mut impl Read) -> io::Result<Vec<u8>> {
+/// for a frame that claims to be over the limit or does not match its checksum. After
+/// `InvalidData` the stream is out of step and has to be closed.
+pub(crate) fn read_frame(reader: &mut impl Read, limit: usize) -> io::Result<Vec<u8>> {
     let mut header = [0; 8];
     reader.read_exact(&mut header)?;
     let (length, checksum) = header.split_at(4);
     let length = u32::from_be_bytes(length.try_into().map_err(|_| invalid("a short header"))?);
     let checksum = u32::from_be_bytes(checksum.try_into().map_err(|_| invalid("a short header"))?);
-    let length =
-        usize::try_from(length).map_err(|_| invalid("the frame is too large to receive"))?;
-    if length > MAX_FRAME {
+    if !usize::try_from(length).is_ok_and(|length| length <= limit) {
         return Err(invalid("the frame is too large to receive"));
     }
-    let mut payload = vec![0; length];
-    reader.read_exact(&mut payload)?;
+    let mut payload = Vec::new();
+    let arrived = (&mut *reader)
+        .take(u64::from(length))
+        .read_to_end(&mut payload)?;
+    if u64::try_from(arrived).ok() != Some(u64::from(length)) {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
     if crc32c::crc32c(&payload) != checksum {
         return Err(invalid("the frame does not match its checksum"));
     }
@@ -560,7 +572,10 @@ impl Snapshot {
 mod tests {
     use std::io::Cursor;
 
-    use super::{ClientRequest, ClientResponse, Hello, PeerFrame, Status, read_frame, write_frame};
+    use super::{
+        CLIENT_FRAME, ClientRequest, ClientResponse, HELLO_FRAME, Hello, PEER_FRAME, PeerFrame,
+        Status, read_frame, write_frame,
+    };
     use crate::kv::{Op, Reply, Request, SessionId};
     use crate::membership::{Change, ChangeError, Membership};
     use crate::raft::Role;
@@ -812,13 +827,18 @@ mod tests {
         write_frame(&mut wire, &[]).expect("writing to memory");
 
         let mut reader = Cursor::new(&wire);
-        assert_eq!(read_frame(&mut reader).expect("a whole frame"), payload);
         assert_eq!(
-            read_frame(&mut reader).expect("an empty frame"),
+            read_frame(&mut reader, PEER_FRAME).expect("a whole frame"),
+            payload
+        );
+        assert_eq!(
+            read_frame(&mut reader, PEER_FRAME).expect("an empty frame"),
             Vec::<u8>::new()
         );
         assert_eq!(
-            read_frame(&mut reader).expect_err("nothing left").kind(),
+            read_frame(&mut reader, PEER_FRAME)
+                .expect_err("nothing left")
+                .kind(),
             std::io::ErrorKind::UnexpectedEof
         );
 
@@ -826,7 +846,7 @@ mod tests {
         let mut flipped = wire.clone();
         flipped[10] ^= 1;
         assert_eq!(
-            read_frame(&mut Cursor::new(&flipped))
+            read_frame(&mut Cursor::new(&flipped), PEER_FRAME)
                 .expect_err("damage")
                 .kind(),
             std::io::ErrorKind::InvalidData
@@ -835,11 +855,37 @@ mod tests {
         let mut huge = wire;
         huge[..4].copy_from_slice(&u32::MAX.to_be_bytes());
         assert_eq!(
-            read_frame(&mut Cursor::new(&huge))
+            read_frame(&mut Cursor::new(&huge), PEER_FRAME)
                 .expect_err("too large")
                 .kind(),
             std::io::ErrorKind::InvalidData
         );
+    }
+
+    /// The header is a claim. It is held against the limit of the connection it arrives on, and
+    /// a claim that is never backed by bytes ends as a short read, not as a buffer of that size.
+    #[test]
+    fn a_frame_is_held_to_the_limit_of_its_connection() {
+        let mut wire = Vec::new();
+        write_frame(&mut wire, &[7; 100]).expect("writing to memory");
+        assert_eq!(
+            read_frame(&mut Cursor::new(&wire), CLIENT_FRAME)
+                .expect("under the limit")
+                .len(),
+            100
+        );
+        let refused = read_frame(&mut Cursor::new(&wire), HELLO_FRAME).expect_err("over the limit");
+        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidData);
+
+        // The largest frame a client connection allows is announced, and three bytes follow.
+        let mut promise = u32::try_from(CLIENT_FRAME)
+            .expect("the limit fits a header")
+            .to_be_bytes()
+            .to_vec();
+        promise.extend_from_slice(&[0, 0, 0, 0, 1, 2, 3]);
+        let short =
+            read_frame(&mut Cursor::new(&promise), CLIENT_FRAME).expect_err("the bytes never came");
+        assert_eq!(short.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
     #[test]

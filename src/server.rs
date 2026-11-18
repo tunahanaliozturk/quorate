@@ -32,7 +32,10 @@ use katman::Options;
 use crate::config::Config;
 use crate::node::{Compaction, ConnId, Effect, Event, Node, NodeError};
 use crate::types::NodeId;
-use crate::wire::{ClientRequest, ClientResponse, Hello, PeerFrame, read_frame, write_frame};
+use crate::wire::{
+    CLIENT_FRAME, ClientRequest, ClientResponse, HELLO_FRAME, Hello, PEER_FRAME, PeerFrame,
+    read_frame, write_frame,
+};
 
 /// Frames waiting for one peer. When the peer is slow or away, newer frames are dropped.
 const PEER_QUEUE: usize = 1024;
@@ -223,12 +226,12 @@ fn read_connection(
 ) -> io::Result<()> {
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(HELLO_TIMEOUT))?;
-    let hello = Hello::decode(&read_frame(&mut stream)?);
+    let hello = Hello::decode(&read_frame(&mut stream, HELLO_FRAME)?);
     stream.set_read_timeout(None)?;
     match hello {
         None => Ok(()),
         Some(Hello::Peer(from)) => loop {
-            let Some(frame) = PeerFrame::decode(&read_frame(&mut stream)?) else {
+            let Some(frame) = PeerFrame::decode(&read_frame(&mut stream, PEER_FRAME)?) else {
                 return Ok(());
             };
             if events.send(Event::Peer { from, frame }).is_err() {
@@ -255,7 +258,7 @@ fn read_connection(
 
 fn read_client(stream: &mut TcpStream, conn: ConnId, events: &Sender<Event>) -> io::Result<()> {
     loop {
-        let Some(request) = ClientRequest::decode(&read_frame(stream)?) else {
+        let Some(request) = ClientRequest::decode(&read_frame(stream, CLIENT_FRAME)?) else {
             return Ok(());
         };
         if events.send(Event::Client { conn, request }).is_err() {

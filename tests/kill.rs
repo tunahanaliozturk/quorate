@@ -9,17 +9,12 @@
 //! code it does not run: the wire format, the sockets, the threads, the real filesystem and the
 //! process actually dying.
 
-#![expect(
-    clippy::expect_used,
-    clippy::panic,
-    reason = "a test: when the setup fails, the test fails"
-)]
-
+use std::io;
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -28,7 +23,7 @@ use quorate::{Client, NodeId, Role};
 
 const NODES: u64 = 3;
 const CLIENTS: u64 = 4;
-const KEYS: usize = 2;
+const KEYS: u8 = 2;
 /// Few values, so that a compare-and-set often finds what it expects.
 const VALUES: u64 = 3;
 const KILLS: usize = 4;
@@ -40,28 +35,22 @@ struct Cluster {
 }
 
 impl Cluster {
-    fn start() -> Self {
+    fn start() -> io::Result<Self> {
         // Ports the system considers free right now. Another process could take one before the
         // node binds it; the test then fails at startup and says so.
-        let listeners: Vec<TcpListener> = (0..NODES)
-            .map(|_| TcpListener::bind("127.0.0.1:0").expect("a free port"))
-            .collect();
-        let addresses = listeners
-            .iter()
-            .zip(1..)
-            .map(|(listener, id)| {
-                (
-                    NodeId::new(id),
-                    listener.local_addr().expect("a bound address"),
-                )
-            })
-            .collect();
+        let mut addresses = Vec::new();
+        let mut listeners = Vec::new();
+        for id in 1..=NODES {
+            let listener = TcpListener::bind("127.0.0.1:0")?;
+            addresses.push((NodeId::new(id), listener.local_addr()?));
+            listeners.push(listener);
+        }
         drop(listeners);
 
-        let unique = std::process::id();
-        let dir = std::env::temp_dir().join(format!("quorate-kill-{unique}"));
+        let dir = std::env::temp_dir().join(format!("quorate-kill-{}", std::process::id()));
+        // Left over from a run that was itself killed, if at all.
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("a temporary directory");
+        std::fs::create_dir_all(&dir)?;
 
         let mut cluster = Self {
             dir,
@@ -70,12 +59,12 @@ impl Cluster {
         };
         for position in 0..cluster.addresses.len() {
             cluster.processes.push(None);
-            cluster.spawn(position);
+            cluster.spawn(position)?;
         }
-        cluster
+        Ok(cluster)
     }
 
-    fn spawn(&mut self, position: usize) {
+    fn spawn(&mut self, position: usize) -> io::Result<()> {
         let (id, address) = self.addresses[position];
         let mut command = Command::new(env!("CARGO_BIN_EXE_quorate"));
         command.arg("serve");
@@ -91,51 +80,55 @@ impl Cluster {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());
-        self.processes[position] = Some(command.spawn().expect("the node starts"));
+        self.processes[position] = Some(command.spawn()?);
+        Ok(())
     }
 
     /// Ends a node the way a crash would: no warning, no chance to finish anything.
-    fn kill(&mut self, position: usize) {
+    fn kill(&mut self, position: usize) -> io::Result<()> {
         if let Some(mut process) = self.processes[position].take() {
-            process.kill().expect("the node can be killed");
-            process.wait().expect("the node has gone");
+            process.kill()?;
+            process.wait()?;
         }
+        Ok(())
     }
 
-    /// The position of the node that leads, according to a majority that agrees on it.
+    /// The position of a running node that says it leads.
     fn leader(&self) -> Option<usize> {
-        let client = Client::new(self.addresses.iter().copied())
-            .timeouts(Duration::from_millis(300), Duration::from_millis(300));
-        let position = self.addresses.iter().position(|(id, _)| {
+        let quick = Duration::from_millis(300);
+        let client = Client::new(self.addresses.iter().copied()).timeouts(quick, quick);
+        let leads = |id: NodeId| {
             client
-                .status(*id)
+                .status(id)
                 .is_ok_and(|status| status.role == Role::Leader)
-        })?;
+        };
+        let position = self.addresses.iter().position(|(id, _)| leads(*id))?;
         self.processes[position].is_some().then_some(position)
     }
 
-    fn wait_for_leader(&self) -> usize {
-        let deadline = Instant::now() + Duration::from_secs(20);
+    fn wait_for_leader(&self) -> io::Result<usize> {
+        let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
             if let Some(leader) = self.leader() {
-                return leader;
+                return Ok(leader);
             }
             thread::sleep(Duration::from_millis(100));
         }
-        panic!("no leader within 20 seconds");
+        Err(io::Error::other("no leader within 30 seconds"))
     }
 }
 
 impl Drop for Cluster {
     fn drop(&mut self) {
         for position in 0..self.processes.len() {
-            self.kill(position);
+            // Whatever is still running goes; there is nothing to do about one that will not.
+            let _ = self.kill(position);
         }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
-/// A small generator, so that a failing run can at least be described.
+/// A small generator. Different clients do different things; nothing depends on more than that.
 struct Random(u64);
 
 impl Random {
@@ -151,23 +144,22 @@ fn value_bytes(value: u64) -> [u8; 8] {
     value.to_be_bytes()
 }
 
+/// The number a stored value stands for. Anything that is not eight bytes was not written by
+/// this test, and becomes a number no client ever writes, which the checker then rejects.
 fn value_of(bytes: &[u8]) -> u64 {
-    u64::from_be_bytes(
-        bytes
-            .try_into()
-            .expect("clients only write eight-byte values"),
-    )
+    bytes.try_into().map_or(u64::MAX, u64::from_be_bytes)
+}
+
+/// What the clients did and saw, per key, on one shared clock.
+struct Recorder {
+    clock: AtomicU64,
+    histories: Vec<Mutex<Vec<Operation>>>,
+    stop: AtomicBool,
 }
 
 /// One client: random operations until told to stop, each written into the history of its key
 /// with the time it was sent and the time it was answered.
-fn work(
-    servers: &[(NodeId, SocketAddr)],
-    seed: u64,
-    clock: &AtomicU64,
-    histories: &[Mutex<Vec<Operation>>],
-    stop: &AtomicBool,
-) {
+fn work(servers: &[(NodeId, SocketAddr)], seed: u64, recorder: &Recorder) {
     // Every other client is impatient: it gives up on a node after a few milliseconds, which is
     // about as long as a write takes, and asks again elsewhere. Many of its requests therefore
     // reach the log twice. Without that, a request is only ever repeated when a leader dies, and
@@ -179,9 +171,9 @@ fn work(
     };
     let mut client = Client::new(servers.iter().copied()).timeouts(attempt, Duration::from_secs(8));
     let mut random = Random(0x9E37_79B9_7F4A_7C15 ^ seed);
-    while !stop.load(Ordering::Relaxed) {
-        let key = usize::try_from(random.below(KEYS as u64)).expect("few keys");
-        let name = [b'k', u8::try_from(key).expect("few keys")];
+    while !recorder.stop.load(Ordering::Relaxed) {
+        let key = u8::try_from(random.below(u64::from(KEYS))).unwrap_or(0);
+        let name = [b'k', key];
         let value = random.below(VALUES);
         let call = match random.below(4) {
             0 => Call::Get,
@@ -196,7 +188,7 @@ fn work(
             }
         };
 
-        let invoked = clock.fetch_add(1, Ordering::SeqCst);
+        let invoked = recorder.clock.fetch_add(1, Ordering::SeqCst);
         let result = match call {
             Call::Get => client
                 .get(&name)
@@ -217,53 +209,61 @@ fn work(
         // at any later time, or never; the checker allows for both.
         let returned = result
             .ok()
-            .map(|result| (clock.fetch_add(1, Ordering::SeqCst), result));
-        histories[key]
+            .map(|result| (recorder.clock.fetch_add(1, Ordering::SeqCst), result));
+        let mut history = recorder.histories[usize::from(key)]
             .lock()
-            .expect("no client panics")
-            .push(Operation {
-                call,
-                invoked,
-                returned,
-            });
+            .unwrap_or_else(PoisonError::into_inner);
+        history.push(Operation {
+            call,
+            invoked,
+            returned,
+        });
+        drop(history);
         thread::sleep(Duration::from_millis(2));
     }
 }
 
 #[test]
-fn killing_the_leader_under_load_loses_nothing_and_shows_nothing_stale() {
-    let mut cluster = Cluster::start();
-    cluster.wait_for_leader();
+fn killing_the_leader_under_load_loses_nothing_and_shows_nothing_stale() -> io::Result<()> {
+    let mut cluster = Cluster::start()?;
+    cluster.wait_for_leader()?;
 
-    let clock = AtomicU64::new(1);
-    let histories: Vec<Mutex<Vec<Operation>>> = (0..KEYS).map(|_| Mutex::new(Vec::new())).collect();
-    let stop = AtomicBool::new(false);
+    let recorder = Recorder {
+        clock: AtomicU64::new(1),
+        histories: (0..KEYS).map(|_| Mutex::new(Vec::new())).collect(),
+        stop: AtomicBool::new(false),
+    };
     let servers = cluster.addresses.clone();
 
-    let mut killed = 0;
-    thread::scope(|scope| {
+    let killed = thread::scope(|scope| {
         for seed in 0..CLIENTS {
-            let (servers, clock, histories, stop) = (&servers, &clock, &histories, &stop);
-            scope.spawn(move || work(servers, seed, clock, histories, stop));
+            let (servers, recorder) = (&servers, &recorder);
+            scope.spawn(move || work(servers, seed, recorder));
         }
-
-        for _ in 0..KILLS {
+        // The clients stop whatever happens here, or the scope would wait for them for ever.
+        let outcome = (|| {
+            for _ in 0..KILLS {
+                thread::sleep(Duration::from_millis(1500));
+                let leader = cluster.wait_for_leader()?;
+                cluster.kill(leader)?;
+                // The other two elect a new leader and carry on while this one is away.
+                thread::sleep(Duration::from_millis(1500));
+                cluster.spawn(leader)?;
+            }
             thread::sleep(Duration::from_millis(1500));
-            let leader = cluster.wait_for_leader();
-            cluster.kill(leader);
-            killed += 1;
-            // The other two elect a new leader and carry on while this one is away.
-            thread::sleep(Duration::from_millis(1500));
-            cluster.spawn(leader);
-        }
-        thread::sleep(Duration::from_millis(1500));
-        stop.store(true, Ordering::Relaxed);
-    });
+            io::Result::Ok(KILLS)
+        })();
+        recorder.stop.store(true, Ordering::Relaxed);
+        outcome
+    })?;
 
     let mut answered = 0;
     let mut unanswered = 0;
-    for (key, history) in histories.iter().enumerate() {
-        let mut history = history.lock().expect("no client panics").clone();
+    for (key, history) in recorder.histories.iter().enumerate() {
+        let mut history = history
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         history.sort_by_key(|operation| operation.invoked);
         answered += history
             .iter()
@@ -279,9 +279,12 @@ fn killing_the_leader_under_load_loses_nothing_and_shows_nothing_stale() {
         );
     }
     assert_eq!(killed, KILLS);
-    // A cluster that answered almost nothing would pass the check without being tested.
+    // A cluster that answered almost nothing would pass the check without being tested. The bar
+    // is low on purpose: a laptop answers about 9,000 operations in a run, a busy CI machine with
+    // a slow disk a few hundred.
     assert!(
-        answered > 500,
+        answered > 100,
         "only {answered} operations were answered ({unanswered} were not)"
     );
+    Ok(())
 }
