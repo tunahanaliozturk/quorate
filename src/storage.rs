@@ -1,17 +1,18 @@
 //! Durable storage for one node's hard state and log, in a katman database.
 //!
-//! Layout: the hard state is under the key `h`; log entry `i` is under `l` followed by `i` as
-//! eight big-endian bytes, so a scan of the `l` prefix returns the log in order. Every
-//! [`Persist`] request becomes one atomic, synced katman batch.
+//! Layout: the hard state is under the key `h`, the point the log starts after under `b`, and log
+//! entry `i` under `l` followed by `i` as eight big-endian bytes, so a scan of the `l` prefix
+//! returns the log in order. Every [`Persist`] request becomes one atomic, synced katman batch.
 
 use core::fmt;
 use std::path::Path;
 
 use katman::{Db, Options, SyncMode, WriteBatch};
 
-use crate::types::{Entry, HardState, Index, NodeId, Payload, Persist, Term};
+use crate::types::{Entry, HardState, Index, NodeId, Payload, Persist, SnapshotMeta, Term};
 
 const HARD_STATE_KEY: &[u8] = b"h";
+const BASE_KEY: &[u8] = b"b";
 const LOG_PREFIX: u8 = b'l';
 const KIND_NOOP: u8 = 0;
 const KIND_COMMAND: u8 = 1;
@@ -57,7 +58,9 @@ pub struct Recovered {
     pub storage: Storage,
     /// The stored term and vote; the default for a node that has never run.
     pub hard_state: HardState,
-    /// The stored log, with the entry for index 1 first.
+    /// The point the stored log starts after; the default for a log that was never compacted.
+    pub base: SnapshotMeta,
+    /// The stored log, starting with the entry right after `base`.
     pub log: Vec<Entry>,
 }
 
@@ -65,6 +68,8 @@ pub struct Recovered {
 #[derive(Debug)]
 pub struct Storage {
     db: Db,
+    /// The index the stored log starts after.
+    base: Index,
     last_index: Index,
 }
 
@@ -86,9 +91,13 @@ impl Storage {
             Some(bytes) => decode_hard_state(&bytes)?,
             None => HardState::default(),
         };
+        let base = match db.get(BASE_KEY)? {
+            Some(bytes) => decode_base(&bytes)?,
+            None => SnapshotMeta::default(),
+        };
 
         let mut log = Vec::new();
-        let mut last_index = Index::ZERO;
+        let mut last_index = base.index();
         for item in db.scan_prefix([LOG_PREFIX]) {
             let (key, value) = item?;
             last_index = last_index.next();
@@ -100,9 +109,15 @@ impl Storage {
             log.push(decode_entry(&value)?);
         }
 
+        let storage = Self {
+            db,
+            base: base.index(),
+            last_index,
+        };
         Ok(Recovered {
-            storage: Self { db, last_index },
+            storage,
             hard_state,
+            base,
             log,
         })
     }
@@ -117,7 +132,21 @@ impl Storage {
         let mut batch = WriteBatch::new();
         batch.put(HARD_STATE_KEY, encode_hard_state(persist.hard_state()));
 
+        let mut base = self.base;
         let mut last_index = self.last_index;
+        if let Some(new_base) = persist.base() {
+            batch.put(BASE_KEY, encode_base(new_base));
+            // ponytail: one delete per entry, in the batch that moves the base. The batch grows
+            // with the distance between two compactions. A range delete in katman would make it
+            // constant; worth it once compactions are far apart.
+            let mut index = base.next();
+            while index <= new_base.index().min(last_index) {
+                batch.delete(log_key(index));
+                index = index.next();
+            }
+            base = new_base.index();
+            last_index = last_index.max(base);
+        }
         if let Some(write) = persist.log() {
             let mut index = write.first_index();
             for entry in write.entries() {
@@ -126,14 +155,16 @@ impl Storage {
             }
             // `index` is now one past the new end. Whatever was stored from there on belonged to
             // a log this node has given up.
-            last_index = index.prev();
-            while index <= self.last_index {
+            let new_last = index.prev();
+            while index <= last_index {
                 batch.delete(log_key(index));
                 index = index.next();
             }
+            last_index = new_last;
         }
 
         self.db.write(batch)?;
+        self.base = base;
         self.last_index = last_index;
         Ok(())
     }
@@ -177,6 +208,29 @@ fn decode_hard_state(bytes: &[u8]) -> Result<HardState, StorageError> {
     ))
 }
 
+/// A snapshot point as sixteen bytes: index, then term. The state machine stores its applied
+/// position the same way.
+pub(crate) fn encode_base(base: SnapshotMeta) -> [u8; 16] {
+    let mut bytes = [0; 16];
+    bytes[..8].copy_from_slice(&base.index().get().to_be_bytes());
+    bytes[8..].copy_from_slice(&base.term().get().to_be_bytes());
+    bytes
+}
+
+pub(crate) fn decode_base(bytes: &[u8]) -> Result<SnapshotMeta, StorageError> {
+    let corrupt = StorageError::Corrupt("a log position has the wrong shape");
+    let Some((index, term)) = bytes.split_first_chunk::<8>() else {
+        return Err(corrupt);
+    };
+    let Ok(term) = <[u8; 8]>::try_from(term) else {
+        return Err(corrupt);
+    };
+    Ok(SnapshotMeta::new(
+        Index::new(u64::from_be_bytes(*index)),
+        Term::new(u64::from_be_bytes(term)),
+    ))
+}
+
 fn encode_entry(entry: &Entry) -> Vec<u8> {
     let command: &[u8] = match entry.payload() {
         Payload::Noop => &[],
@@ -214,7 +268,7 @@ mod tests {
 
     use super::{Recovered, Storage};
     use crate::types::{
-        Entry, HardState, Index, LogWrite, NodeId, Payload, Persist, PersistSeq, Term,
+        Entry, HardState, Index, LogWrite, NodeId, Payload, Persist, PersistSeq, SnapshotMeta, Term,
     };
 
     fn entry(term: u64, command: &[u8]) -> Entry {
@@ -225,10 +279,27 @@ mod tests {
         Storage::open("node", Options::default().with_sim_fs(fs.clone())).expect("storage opens")
     }
 
-    fn request(seq: u64, term: u64, vote: Option<u64>, log: Option<(u64, Vec<Entry>)>) -> Persist {
+    /// Opens the storage as it would be after a power cut.
+    fn reopen(fs: &mut SimFs, storage: Storage) -> Recovered {
+        *fs = fs.power_loss(Torn::Nothing);
+        drop(storage);
+        open(fs)
+    }
+
+    fn base(index: u64, term: u64) -> SnapshotMeta {
+        SnapshotMeta::new(Index::new(index), Term::new(term))
+    }
+
+    fn request(
+        term: u64,
+        vote: Option<u64>,
+        base: Option<SnapshotMeta>,
+        log: Option<(u64, Vec<Entry>)>,
+    ) -> Persist {
         Persist::new(
-            PersistSeq::new(seq),
+            PersistSeq::new(1),
             HardState::new(Term::new(term), vote.map(NodeId::new)),
+            base,
             log.map(|(first, entries)| LogWrite::new(Index::new(first), entries)),
         )
     }
@@ -237,12 +308,13 @@ mod tests {
     fn a_node_that_never_ran_recovers_as_empty() {
         let recovered = open(&SimFs::new());
         assert_eq!(recovered.hard_state, HardState::default());
+        assert_eq!(recovered.base, SnapshotMeta::default());
         assert_eq!(recovered.log, Vec::new());
     }
 
     #[test]
     fn what_was_persisted_survives_a_power_cut() {
-        let fs = SimFs::new();
+        let mut fs = SimFs::new();
         let mut storage = open(&fs).storage;
         let log = vec![
             entry(1, b"a"),
@@ -250,12 +322,10 @@ mod tests {
             entry(2, b""),
         ];
         storage
-            .persist(&request(1, 2, Some(3), Some((1, log.clone()))))
+            .persist(&request(2, Some(3), None, Some((1, log.clone()))))
             .expect("write succeeds");
 
-        let fs = fs.power_loss(Torn::Nothing);
-        drop(storage);
-        let recovered = open(&fs);
+        let recovered = reopen(&mut fs, storage);
         assert_eq!(
             recovered.hard_state,
             HardState::new(Term::new(2), Some(NodeId::new(3)))
@@ -265,7 +335,7 @@ mod tests {
 
     #[test]
     fn a_write_in_the_middle_replaces_the_old_tail() {
-        let fs = SimFs::new();
+        let mut fs = SimFs::new();
         let mut storage = open(&fs).storage;
         let old = vec![
             entry(1, b"a"),
@@ -274,21 +344,19 @@ mod tests {
             entry(1, b"d"),
         ];
         storage
-            .persist(&request(1, 1, None, Some((1, old))))
+            .persist(&request(1, None, None, Some((1, old))))
             .expect("write succeeds");
         // A new leader overwrites from index 2 with a shorter tail.
         storage
-            .persist(&request(2, 2, None, Some((2, vec![entry(2, b"x")]))))
+            .persist(&request(2, None, None, Some((2, vec![entry(2, b"x")]))))
             .expect("write succeeds");
         // A later append lands right after the new end.
         storage
-            .persist(&request(3, 2, None, Some((3, vec![entry(2, b"y")]))))
+            .persist(&request(2, None, None, Some((3, vec![entry(2, b"y")]))))
             .expect("write succeeds");
 
-        let fs = fs.power_loss(Torn::Nothing);
-        drop(storage);
         assert_eq!(
-            open(&fs).log,
+            reopen(&mut fs, storage).log,
             vec![entry(1, b"a"), entry(2, b"x"), entry(2, b"y")]
         );
     }
@@ -298,10 +366,10 @@ mod tests {
         let fs = SimFs::new();
         let mut storage = open(&fs).storage;
         storage
-            .persist(&request(1, 1, None, Some((1, vec![entry(1, b"a")]))))
+            .persist(&request(1, None, None, Some((1, vec![entry(1, b"a")]))))
             .expect("write succeeds");
         storage
-            .persist(&request(2, 5, Some(2), None))
+            .persist(&request(5, Some(2), None, None))
             .expect("write succeeds");
 
         let fs = fs.process_crash();
@@ -312,5 +380,64 @@ mod tests {
             HardState::new(Term::new(5), Some(NodeId::new(2)))
         );
         assert_eq!(recovered.log, vec![entry(1, b"a")]);
+    }
+
+    #[test]
+    fn moving_the_base_removes_the_entries_before_it_and_keeps_the_rest() {
+        let mut fs = SimFs::new();
+        let mut storage = open(&fs).storage;
+        let log = vec![
+            entry(1, b"a"),
+            entry(1, b"b"),
+            entry(2, b"c"),
+            entry(2, b"d"),
+        ];
+        storage
+            .persist(&request(2, None, None, Some((1, log))))
+            .expect("write succeeds");
+        storage
+            .persist(&request(2, None, Some(base(2, 1)), None))
+            .expect("write succeeds");
+        // The log goes on after a compaction as if nothing happened.
+        storage
+            .persist(&request(2, None, None, Some((5, vec![entry(2, b"e")]))))
+            .expect("write succeeds");
+
+        let recovered = reopen(&mut fs, storage);
+        assert_eq!(recovered.base, base(2, 1));
+        assert_eq!(
+            recovered.log,
+            vec![entry(2, b"c"), entry(2, b"d"), entry(2, b"e")]
+        );
+    }
+
+    #[test]
+    fn a_base_past_the_end_leaves_an_empty_log_that_continues_from_there() {
+        let mut fs = SimFs::new();
+        let mut storage = open(&fs).storage;
+        storage
+            .persist(&request(
+                1,
+                None,
+                None,
+                Some((1, vec![entry(1, b"a"), entry(1, b"b")])),
+            ))
+            .expect("write succeeds");
+        // A snapshot was installed: the log starts over after index 9, and what was stored goes.
+        storage
+            .persist(&request(3, None, Some(base(9, 3)), Some((10, Vec::new()))))
+            .expect("write succeeds");
+
+        let recovered = reopen(&mut fs, storage);
+        assert_eq!(recovered.base, base(9, 3));
+        assert_eq!(recovered.log, Vec::new());
+
+        let mut storage = recovered.storage;
+        storage
+            .persist(&request(3, None, None, Some((10, vec![entry(3, b"j")]))))
+            .expect("write succeeds");
+        let recovered = reopen(&mut fs, storage);
+        assert_eq!(recovered.base, base(9, 3));
+        assert_eq!(recovered.log, vec![entry(3, b"j")]);
     }
 }

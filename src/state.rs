@@ -13,8 +13,8 @@ use std::path::Path;
 use katman::{Db, Options, SyncMode, WriteBatch};
 
 use crate::kv::{Op, Reply, Request, SessionId};
-use crate::storage::StorageError;
-use crate::types::{Entry, Index, Payload};
+use crate::storage::{StorageError, decode_base, encode_base};
+use crate::types::{Entry, Index, Payload, SnapshotMeta};
 
 const APPLIED_KEY: &[u8] = b"a";
 const DATA_PREFIX: u8 = b'd';
@@ -31,11 +31,27 @@ pub struct Outcome {
     pub reply: Reply,
 }
 
+/// A copy of a whole state machine at one point of the log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Snapshot {
+    meta: SnapshotMeta,
+    rows: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+impl Snapshot {
+    /// The point of the log the snapshot covers.
+    #[must_use]
+    pub const fn meta(&self) -> SnapshotMeta {
+        self.meta
+    }
+}
+
 /// One node's copy of the key-value store.
 #[derive(Debug)]
 pub struct StateMachine {
     db: Db,
-    applied: Index,
+    /// The last entry applied: its index and its term.
+    applied: SnapshotMeta,
     #[cfg(test)]
     apply_retries_again: bool,
 }
@@ -54,15 +70,8 @@ impl StateMachine {
         options.sync = SyncMode::Never;
         let db = Db::open(dir, options)?;
         let applied = match db.get(APPLIED_KEY)? {
-            None => Index::ZERO,
-            Some(bytes) => {
-                let Ok(raw) = <[u8; 8]>::try_from(bytes.as_slice()) else {
-                    return Err(StorageError::Corrupt(
-                        "the applied index has the wrong shape",
-                    ));
-                };
-                Index::new(u64::from_be_bytes(raw))
-            }
+            None => SnapshotMeta::default(),
+            Some(bytes) => decode_base(&bytes)?,
         };
         Ok(Self {
             db,
@@ -72,11 +81,74 @@ impl StateMachine {
         })
     }
 
-    /// The index of the last entry applied. A restarting node hands this to
-    /// [`Raft::recover`](crate::Raft::recover).
+    /// The index of the last entry applied.
     #[must_use]
     pub const fn applied_index(&self) -> Index {
+        self.applied.index()
+    }
+
+    /// The last entry applied, as index and term. A restarting node hands this to
+    /// [`Raft::recover`](crate::Raft::recover).
+    #[must_use]
+    pub const fn applied(&self) -> SnapshotMeta {
         self.applied
+    }
+
+    /// Forces everything applied so far to disk and returns the position that is now durable.
+    /// After this the log up to that index is no longer needed to rebuild the state machine, and
+    /// the node may be told to compact it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Db`] when the flush fails.
+    pub fn checkpoint(&self) -> Result<SnapshotMeta, StorageError> {
+        self.db.flush()?;
+        Ok(self.applied)
+    }
+
+    /// Copies the whole state machine as it is now, to send to a follower that is too far
+    /// behind to catch up from the log.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Db`] when a read fails.
+    // ponytail: the whole store in one value. Fine while a store fits in memory and in one
+    // message; stream it in chunks when it does not.
+    pub fn snapshot(&self) -> Result<Snapshot, StorageError> {
+        let rows = self.db.iter().collect::<Result<Vec<_>, _>>()?;
+        Ok(Snapshot {
+            meta: self.applied,
+            rows,
+        })
+    }
+
+    /// Replaces the whole state machine with `snapshot` and forces it to disk, unless the state
+    /// machine is already at least as far. Returns whether it was replaced.
+    ///
+    /// The swap is one atomic batch: after a crash the store is either the old one or the new
+    /// one. It is durable when this returns, which the log relies on: the node drops the entries
+    /// the snapshot covers right after.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Db`] when a read, the write or the flush fails.
+    pub fn install(&mut self, snapshot: &Snapshot) -> Result<bool, StorageError> {
+        if snapshot.meta.index() <= self.applied.index() {
+            return Ok(false);
+        }
+        let mut batch = WriteBatch::new();
+        for item in self.db.iter() {
+            let (key, _) = item?;
+            batch.delete(key);
+        }
+        for (key, value) in &snapshot.rows {
+            batch.put(key, value);
+        }
+        batch.put(APPLIED_KEY, encode_base(snapshot.meta));
+        self.db.write(batch)?;
+        self.db.flush()?;
+        self.applied = snapshot.meta;
+        Ok(true)
     }
 
     /// Reads a key directly, without going through the log. The result reflects whatever this
@@ -101,14 +173,15 @@ impl StateMachine {
     /// decode, and [`StorageError::Db`] when a read or the write fails. After an error the node
     /// must stop.
     pub fn apply(&mut self, index: Index, entry: &Entry) -> Result<Option<Outcome>, StorageError> {
-        if index <= self.applied {
+        if index <= self.applied.index() {
             return Ok(None);
         }
-        if index != self.applied.next() {
+        if index != self.applied.index().next() {
             return Err(StorageError::Corrupt("an entry was applied out of order"));
         }
         let mut batch = WriteBatch::new();
-        batch.put(APPLIED_KEY, index.get().to_be_bytes());
+        let applied = SnapshotMeta::new(index, entry.term());
+        batch.put(APPLIED_KEY, encode_base(applied));
         // Bytes that are not a request change nothing. Every node decides that the same way, so
         // the stores stay identical.
         let request = match entry.payload() {
@@ -120,7 +193,7 @@ impl StateMachine {
             None => None,
         };
         self.db.write(batch)?;
-        self.applied = index;
+        self.applied = applied;
         Ok(outcome)
     }
 
@@ -349,6 +422,86 @@ mod tests {
         let mut state = open(&SimFs::new());
         assert!(state.apply(Index::new(2), &entry(1, 1, put(b"a"))).is_err());
         assert_eq!(state.applied_index(), Index::ZERO);
+    }
+
+    #[test]
+    fn a_checkpoint_survives_a_power_cut() {
+        let fs = SimFs::new();
+        let mut state = open(&fs);
+        let entries: Vec<Entry> = (1..=10)
+            .map(|seq| entry(1, seq, put(&seq.to_be_bytes())))
+            .collect();
+        run(&mut state, &entries);
+        let durable = state.checkpoint().expect("the flush succeeds");
+        assert_eq!(durable.index(), Index::new(10));
+        // Applied after the checkpoint, and not flushed.
+        state
+            .apply(Index::new(11), &entry(1, 11, put(b"later")))
+            .expect("apply succeeds");
+
+        let fs = fs.power_loss(Torn::Nothing);
+        drop(state);
+        let state = open(&fs);
+        assert_eq!(state.applied(), durable);
+        assert_eq!(
+            state.get(b"k").expect("read succeeds"),
+            Some(10_u64.to_be_bytes().to_vec())
+        );
+    }
+
+    #[test]
+    fn a_snapshot_replaces_everything_and_survives_a_power_cut() {
+        let mut source = open(&SimFs::new());
+        run(
+            &mut source,
+            &[
+                entry(1, 1, put(b"a")),
+                entry(2, 1, put(b"b")),
+                entry(1, 2, get()),
+            ],
+        );
+        let snapshot = source.snapshot().expect("the snapshot is read");
+        assert_eq!(snapshot.meta().index(), Index::new(3));
+
+        // The receiver holds something else entirely, under another key and another session.
+        let fs = SimFs::new();
+        let mut target = open(&fs);
+        let other = Op::Put {
+            key: b"other".to_vec(),
+            value: b"x".to_vec(),
+        };
+        run(&mut target, &[entry(9, 1, other)]);
+        assert!(target.install(&snapshot).expect("the install succeeds"));
+        assert_eq!(target.dump(), source.dump());
+
+        let fs = fs.power_loss(Torn::Nothing);
+        drop(target);
+        let mut target = open(&fs);
+        assert_eq!(target.dump(), source.dump());
+        assert_eq!(target.applied(), source.applied());
+        // The sessions came along: a retry of a request the source has seen is not carried out.
+        let retry = target
+            .apply(Index::new(4), &entry(2, 1, put(b"b")))
+            .expect("apply succeeds");
+        assert_eq!(retry.map(|outcome| outcome.reply), Some(Reply::Done));
+    }
+
+    #[test]
+    fn a_snapshot_that_is_not_newer_is_ignored() {
+        let mut source = open(&SimFs::new());
+        run(&mut source, &[entry(1, 1, put(b"old"))]);
+        let snapshot = source.snapshot().expect("the snapshot is read");
+
+        let mut target = open(&SimFs::new());
+        run(
+            &mut target,
+            &[entry(1, 1, put(b"old")), entry(1, 2, put(b"new"))],
+        );
+        assert!(!target.install(&snapshot).expect("the install succeeds"));
+        assert_eq!(
+            target.get(b"k").expect("read succeeds"),
+            Some(b"new".to_vec())
+        );
     }
 
     /// The database is not synced, so a power cut may lose recent batches. What is left must be

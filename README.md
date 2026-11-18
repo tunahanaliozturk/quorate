@@ -6,14 +6,15 @@ A meeting is *quorate* when enough members are present to make a binding decisio
 
 ## Status
 
-Milestones 1 to 4 of 8 are done: the Raft core with pre-vote and check-quorum, durable storage in katman, the key-value state machine with client sessions, reads that skip the log, and the simulator that tests all of it. There is no network and no server yet, so this is not usable as a database.
+Milestones 1 to 5 of 8 are done: the Raft core with pre-vote and check-quorum, durable storage in katman, the key-value state machine with client sessions, reads that skip the log, log compaction with snapshots, and the simulator that tests all of it. There is no network and no server yet, so this is not usable as a database.
 
 What the simulator shows today, all reproducible with `cargo test`:
 
-- 10,000 seeds, each 1,500 ticks on a cluster of three or five nodes, break no safety property. The faults are dropped, duplicated and delayed messages, changing partitions, slow disks, drifting clocks, power cuts, and clients that lose requests and replies and send them again.
+- 10,000 seeds, each 1,500 ticks on a cluster of three or five nodes, break no safety property. The faults are dropped, duplicated and delayed messages, changing partitions, slow disks, drifting clocks, power cuts, and clients that lose requests and replies and send them again. A weekly job runs 200,000 seeds.
 - After the faults stop and every node is back, every seed converges on one fully committed log that holds every entry any node ever applied. No acknowledged entry is lost.
-- The history of every key is linearizable, with most reads served by the leader without a log entry, and the state machines of all nodes end up byte for byte identical. The first 1,000 seeds complete 96 client operations each on average.
-- Five rules are switched off one at a time to prove the simulator would notice. Of the first 1,000 seeds, the missing log check on votes fails 676, carrying out a retried request twice fails 360, sending a message before its write is durable fails 143, answering a read without confirming leadership fails 22, and committing an earlier term's entry by counting replicas (figure 8 of the Raft paper) fails 5. The last one needs a long chain of events, and pre-vote and check-quorum make that chain rarer still.
+- The history of every key is linearizable, with most reads served by the leader without a log entry, and the state machines of all nodes end up byte for byte identical. The first 1,000 seeds complete 99 client operations each on average.
+- Logs stay bounded. Nodes compact every 8, 32 or 128 applied entries, and followers that fall behind are caught up with snapshots: 5,219 of them in the first 1,000 seeds.
+- Six rules are switched off one at a time to prove the simulator would notice. Of the first 1,000 seeds, the missing log check on votes fails 682, compacting the log before the state machine is on disk fails 519, carrying out a retried request twice fails 378, sending a message before its write is durable fails 136, answering a read without confirming leadership fails 35, and committing an earlier term's entry by counting replicas (figure 8 of the Raft paper) fails 1. That last chain of events is too rare to leave to chance, so a unit test walks through it step by step, with the rule and without.
 
 A failing seed replays exactly with `QUORATE_SEED=n cargo test`.
 

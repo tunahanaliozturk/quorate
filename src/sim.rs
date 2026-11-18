@@ -14,13 +14,16 @@
 //! - Nodes lose power. A node that goes down forgets everything in memory and every write that
 //!   had not completed. Its log and its state machine are katman databases on katman's simulated
 //!   filesystem, which drops unsynced bytes on a power cut. It restarts later from what they hold.
+//! - Logs are compacted: every few applied entries a node forces its state machine to disk and
+//!   drops the log before it. A follower that falls behind the leader's log gets a snapshot.
 //! - Clients lose requests and replies, give up waiting and send the same request to another
 //!   node, and now and then send an old request again. Most gets are served by the leader
 //!   without a log entry; the rest go through the log.
 //!
 //! Checked after every step: election safety, state machine safety, leader completeness, and that
 //! no node applies an entry before its own disk has it.
-//! Checked every few ticks and at the end: log matching, and that committed entries never change.
+//! Checked every few ticks and at the end: log matching, that committed entries never change, and
+//! that no log holds more applied entries than the compaction policy allows.
 //! At the end every node is restarted, the network heals and the cluster has to converge on one
 //! log that holds every entry that was ever committed, answer every client, and commit something
 //! new. Then the history of every key is checked for linearizability, and the state machines of
@@ -35,7 +38,7 @@ use crate::kv::{Op, Reply, Request, SessionId};
 use crate::linearizability::{Call, Operation, Return, linearizable};
 use crate::raft::{Bug, Raft, Role};
 use crate::rng::Rng;
-use crate::state::{Outcome, StateMachine};
+use crate::state::{Outcome, Snapshot, StateMachine};
 use crate::storage::{Recovered, Storage};
 use crate::types::{Entry, Index, Input, Message, NodeId, Output, Persist, ReadId, Term};
 
@@ -66,6 +69,11 @@ pub(crate) enum Violation {
     AppliedBeforeDurable { node: usize, index: Index },
     /// A node's log no longer holds an entry it had committed.
     CommittedEntryChanged { node: usize, index: usize },
+    /// A node keeps more applied entries in its log than the compaction policy allows.
+    LogNotCompacted { node: usize },
+    /// A node came back with a log that starts after what its state machine holds. The entries in
+    /// between are gone for good.
+    StateLost { node: usize },
     /// What the clients saw on this key cannot be explained by any order of their operations.
     NotLinearizable { key: usize },
     /// A node's state machine differs from node 0's although both applied the same log.
@@ -80,10 +88,31 @@ impl Violation {
     }
 }
 
+/// What travels between two nodes.
+#[derive(Clone)]
+enum Parcel {
+    Message(Message),
+    /// A copy of the sender's state machine, with the term and round the core asked to pass on.
+    Snapshot {
+        term: Term,
+        round: u64,
+        snapshot: Snapshot,
+    },
+}
+
 struct Envelope {
     from: usize,
     to: usize,
-    message: Message,
+    parcel: Parcel,
+}
+
+/// What a run achieved, to check that the tests are not passing on an idle cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Totals {
+    pub(crate) committed: usize,
+    pub(crate) operations: usize,
+    /// Snapshots that replaced a follower's state machine.
+    pub(crate) snapshots: usize,
 }
 
 /// The parts of a node that a power cut destroys.
@@ -149,6 +178,12 @@ pub(crate) struct Sim {
     max_delay: u64,
     max_disk_delay: u64,
     crash_per_mille: u64,
+    /// A node compacts its log once this many applied entries have piled up in it.
+    compact_every: u64,
+    /// Applied entries a compaction leaves in the log, for followers that are only a little
+    /// behind.
+    retain: u64,
+    snapshots: usize,
     /// The first leader seen in each term.
     leaders: HashMap<Term, usize>,
     /// Every entry any node has applied, by position.
@@ -244,6 +279,9 @@ impl Sim {
             max_delay: 1 + rng.below(8),
             max_disk_delay: [0, 0, 3, 8][to_usize(rng.below(4))],
             crash_per_mille: [0, 4, 12][to_usize(rng.below(3))],
+            compact_every: [8, 32, 128][to_usize(rng.below(3))],
+            retain: [0, 4][to_usize(rng.below(2))],
+            snapshots: 0,
             leaders: HashMap::new(),
             committed: Vec::new(),
             next_command: 0,
@@ -255,14 +293,15 @@ impl Sim {
             rng,
         };
         for node in 0..size {
-            sim.boot(node);
+            sim.boot(node)
+                .expect("an empty disk holds nothing that could be lost");
         }
         sim
     }
 
     /// Runs `ticks` of faults, then heals everything and checks that the cluster recovers.
     /// Returns how many entries were committed and how many client operations completed.
-    pub(crate) fn run(mut self, ticks: u64) -> Result<(usize, usize), Violation> {
+    pub(crate) fn run(mut self, ticks: u64) -> Result<Totals, Violation> {
         for _ in 0..ticks {
             if self.chance(3) {
                 self.change_partition();
@@ -292,10 +331,11 @@ impl Sim {
         }
         self.check_logs()?;
         self.settle()?;
-        Ok((
-            self.committed.len(),
-            self.histories.iter().map(Vec::len).sum(),
-        ))
+        Ok(Totals {
+            committed: self.committed.len(),
+            operations: self.histories.iter().map(Vec::len).sum(),
+            snapshots: self.snapshots,
+        })
     }
 
     fn chance(&mut self, percent: u64) -> bool {
@@ -323,20 +363,24 @@ impl Sim {
     }
 
     /// Starts a node from whatever its disk holds.
-    fn boot(&mut self, node: usize) {
+    fn boot(&mut self, node: usize) -> Result<(), Violation> {
         let slot = &mut self.nodes[node];
         let options = || Options::default().with_sim_fs(slot.fs.clone());
         let Recovered {
             storage,
             hard_state,
+            base,
             log,
         } = Storage::open("log", options()).expect("storage opens after any crash");
         let mut state = StateMachine::open("state", options())
             .expect("the state machine opens after any crash");
         // A new seed each time, or a node would repeat the election timeouts of its last life.
         slot.config.seed = self.rng.next_u64();
-        let mut raft = Raft::recover(slot.config.clone(), hard_state, log, state.applied_index())
-            .expect("the state machine is never ahead of the log");
+        let Ok(mut raft) =
+            Raft::recover(slot.config.clone(), hard_state, base, log, state.applied())
+        else {
+            return Err(Violation::StateLost { node });
+        };
         if let Some(bug) = self.bug {
             raft.inject(bug);
         }
@@ -351,6 +395,9 @@ impl Sim {
             disk: VecDeque::new(),
             parked: Vec::new(),
         });
+        // The write that moved the start of the log may have been lost with the power, while the
+        // state machine it was based on survived. The policy applies from the first moment.
+        self.maybe_compact(node)
     }
 
     /// Cuts the power to a node. Memory and unfinished writes are gone; the disk keeps what was
@@ -371,7 +418,7 @@ impl Sim {
         self.now += 1;
         for node in 0..self.nodes.len() {
             if self.nodes[node].live.is_none() && self.nodes[node].restart_at <= self.now {
-                self.boot(node);
+                self.boot(node)?;
             }
             while let Some(persist) = self.next_finished_write(node) {
                 self.finish_write(node, &persist)?;
@@ -385,11 +432,7 @@ impl Sim {
             if self.blocked[envelope.from][envelope.to] {
                 continue;
             }
-            let input = Input::Message {
-                from: node_id(envelope.from),
-                message: envelope.message,
-            };
-            self.step(envelope.to, input)?;
+            self.deliver(envelope)?;
         }
         for node in 0..self.nodes.len() {
             if self.chance(self.nodes[node].clock_percent) {
@@ -443,7 +486,25 @@ impl Sim {
         for output in live.raft.step(input) {
             match output {
                 Output::Persist(persist) => finished = self.start_write(node, persist),
-                Output::Send { to, message } => self.send(node, position_of(to), &message),
+                Output::Send { to, message } => {
+                    self.send(node, position_of(to), &Parcel::Message(message));
+                }
+                Output::SendSnapshot { to, term, round } => {
+                    let state = self.nodes[node].live.as_ref().map(|live| &live.state);
+                    let snapshot = state
+                        .map(|state| state.snapshot().expect("the simulated disk does not fail"));
+                    if let Some(snapshot) = snapshot {
+                        self.send(
+                            node,
+                            position_of(to),
+                            &Parcel::Snapshot {
+                                term,
+                                round,
+                                snapshot,
+                            },
+                        );
+                    }
+                }
                 Output::Apply { index, entry } => self.apply(node, index, entry)?,
                 Output::ReadReady { id, index } => {
                     if let Some(live) = self.nodes[node].live.as_mut() {
@@ -458,13 +519,46 @@ impl Sim {
         self.check_leader(node)?;
         // Only now, after everything this step asked for is done. Telling the node earlier would
         // run a second step inside the first and apply later entries before earlier ones.
-        match finished {
-            Some(persist) => self.finish_write(node, &persist),
-            None => Ok(()),
+        if let Some(persist) = finished {
+            self.finish_write(node, &persist)?;
         }
+        self.maybe_compact(node)
     }
 
-    fn send(&mut self, from: usize, to: usize, message: &Message) {
+    /// The compaction policy a real node would run: once enough applied entries have piled up in
+    /// the log, force the state machine to disk and tell the node that the log before that point
+    /// can go.
+    fn maybe_compact(&mut self, node: usize) -> Result<(), Violation> {
+        let Some(live) = self.nodes[node].live.as_mut() else {
+            return Ok(());
+        };
+        // The node's own count, not the state machine's. The state machine can be ahead: a
+        // snapshot from a leader the node no longer follows is installed all the same, because
+        // it is committed state, but the node does not move its log for it.
+        let applied = live.raft.applied_index().get();
+        if applied < live.raft.log_base().index().get() + self.compact_every {
+            return Ok(());
+        }
+        // The order is the point. With the bug the log is cut on the word of a state machine
+        // whose latest writes a power cut can still take away.
+        let durable = if self.bug == Some(Bug::CompactBeforeCheckpoint) {
+            applied
+        } else {
+            live.state
+                .checkpoint()
+                .expect("the simulated disk does not fail")
+                .index()
+                .get()
+        };
+        self.step(
+            node,
+            Input::Compact {
+                index: Index::new(durable.saturating_sub(self.retain)),
+            },
+        )
+    }
+
+    fn send(&mut self, from: usize, to: usize, parcel: &Parcel) {
         if self.chance(self.drop_percent) {
             return;
         }
@@ -481,10 +575,51 @@ impl Sim {
                 Envelope {
                     from,
                     to,
-                    message: message.clone(),
+                    parcel: parcel.clone(),
                 },
             );
         }
+    }
+
+    /// Hands a parcel to the node it was sent to.
+    fn deliver(&mut self, envelope: Envelope) -> Result<(), Violation> {
+        let from = node_id(envelope.from);
+        let (term, round, snapshot) = match envelope.parcel {
+            Parcel::Message(message) => {
+                return self.step(envelope.to, Input::Message { from, message });
+            }
+            Parcel::Snapshot {
+                term,
+                round,
+                snapshot,
+            } => (term, round, snapshot),
+        };
+        let Some(live) = self.nodes[envelope.to].live.as_mut() else {
+            return Ok(());
+        };
+        // The state machine first, and durably. Only then is the node told, because it drops its
+        // log on the strength of it.
+        let installed = live
+            .state
+            .install(&snapshot)
+            .expect("the simulated disk does not fail");
+        self.snapshots += usize::from(installed);
+        self.step(
+            envelope.to,
+            Input::Snapshot {
+                from,
+                term,
+                round,
+                snapshot: snapshot.meta(),
+            },
+        )?;
+        // The worst moment for the power to go: the state machine holds the snapshot, and the
+        // write that makes the log match it may still be in flight. The node must come back
+        // with a log that agrees with its state machine either way.
+        if installed && self.crash_per_mille > 0 && self.chance(30) {
+            self.crash(envelope.to);
+        }
+        Ok(())
     }
 
     /// A committed entry reaches a node's state machine, and its answer may reach a client.
@@ -807,9 +942,12 @@ impl Sim {
                 second: node,
             }),
             None => {
+                // Entries before the base are in the leader's snapshot. Those it applied itself,
+                // and state machine safety covers them.
+                let base = to_usize(raft.log_base().index().get());
                 let log = raft.log();
-                let missing =
-                    (0..self.committed.len()).find(|&i| log.get(i) != self.committed.get(i));
+                let missing = (base..self.committed.len())
+                    .find(|&i| log.get(i - base) != self.committed.get(i));
                 self.leaders.insert(term, node);
                 match missing {
                     Some(index) => Err(Violation::LeaderCompleteness {
@@ -826,23 +964,32 @@ impl Sim {
     /// record.
     fn check_logs(&self) -> Result<(), Violation> {
         for (a, first) in self.up() {
+            let base = to_usize(first.log_base().index().get());
             let log = first.log();
             let committed = to_usize(first.commit_index().get());
-            if let Some(index) = (0..committed).find(|&i| log.get(i) != self.committed.get(i)) {
+            if let Some(index) =
+                (base..committed).find(|&i| log.get(i - base) != self.committed.get(i))
+            {
                 return Err(Violation::CommittedEntryChanged { node: a, index });
             }
+            // The log stays bounded: applied entries do not pile up past the compaction policy.
+            if first.applied_index().get() >= first.log_base().index().get() + self.compact_every {
+                return Err(Violation::LogNotCompacted { node: a });
+            }
             for (b, second) in self.up().filter(|&(b, _)| b > a) {
+                let other_base = to_usize(second.log_base().index().get());
                 let other = second.log();
-                let shared = log.len().min(other.len());
-                // The highest position where both hold an entry of the same term. Everything up
-                // to it has to be identical.
-                let Some(agreed) = (0..shared)
-                    .rev()
-                    .find(|&i| log[i].term() == other[i].term())
-                else {
+                // The positions both logs hold, counted from the start of history.
+                let shared = base.max(other_base)..(base + log.len()).min(other_base + other.len());
+                // The highest of them where both hold an entry of the same term. Everything they
+                // both hold up to it has to be identical.
+                let same_term = |i: &usize| log[*i - base].term() == other[*i - other_base].term();
+                let Some(agreed) = shared.clone().rev().find(same_term) else {
                     continue;
                 };
-                if let Some(index) = (0..=agreed).find(|&i| log[i] != other[i]) {
+                if let Some(index) =
+                    (shared.start..=agreed).find(|&i| log[i - base] != other[i - other_base])
+                {
                     return Err(Violation::LogMatching { a, b, index });
                 }
             }
@@ -853,11 +1000,11 @@ impl Sim {
     /// Whether every node is up and holds the whole committed log and nothing else, and no
     /// client is still waiting.
     fn quiet(&self) -> bool {
-        let length = self.committed.len();
+        let length = to_u64(self.committed.len());
         self.up().count() == self.nodes.len()
             && self.clients.iter().all(|client| client.waiting.is_none())
             && self.up().all(|(_, raft)| {
-                raft.log().len() == length && to_usize(raft.commit_index().get()) == length
+                raft.last_log_index().get() == length && raft.commit_index().get() == length
             })
     }
 
@@ -897,7 +1044,7 @@ impl Sim {
         // is one entry, so the time allowed grows with the longest log.
         let longest = self
             .up()
-            .map(|(_, raft)| raft.log().len())
+            .map(|(_, raft)| to_usize(raft.last_log_index().get()))
             .max()
             .unwrap_or(0);
         let budget = 300 + 4 * to_u64(longest.max(self.committed.len()));
@@ -967,6 +1114,7 @@ mod tests {
         let next = AtomicU64::new(range.start);
         let failures = Mutex::new(Vec::new());
         let operations = AtomicU64::new(0);
+        let snapshots = AtomicU64::new(0);
         let workers = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
 
         std::thread::scope(|scope| {
@@ -978,8 +1126,11 @@ mod tests {
                             break;
                         }
                         match Sim::new(seed, None).run(TICKS) {
-                            Ok((_, completed)) => {
-                                operations.fetch_add(super::to_u64(completed), Ordering::Relaxed);
+                            Ok(totals) => {
+                                operations
+                                    .fetch_add(super::to_u64(totals.operations), Ordering::Relaxed);
+                                snapshots
+                                    .fetch_add(super::to_u64(totals.snapshots), Ordering::Relaxed);
                             }
                             Err(violation) => failures
                                 .lock()
@@ -999,14 +1150,22 @@ mod tests {
         );
         // A run in which no client got an answer would pass every check without testing anything.
         assert!(operations.load(Ordering::Relaxed) > 0);
+        // Nor would the snapshot path be tested if no follower ever needed one. A single seed
+        // may well not; a hundred do.
+        if range.end - range.start >= 100 {
+            assert!(snapshots.load(Ordering::Relaxed) > 0);
+        }
     }
 
     #[test]
     fn committing_an_earlier_term_by_counting_replicas_is_caught() {
-        let found = first_safety_violation(Bug::CommitEarlierTerm, 1_000);
+        // This bug needs a long chain of events and has become rare since pre-vote and
+        // check-quorum cut down on needless elections. The chain itself is reproduced step by
+        // step in `raft::tests`; here the random search gets a larger budget.
+        let found = first_safety_violation(Bug::CommitEarlierTerm, 3_000);
         assert!(
             found.is_some(),
-            "no seed below 1,000 exposed the figure 8 commit bug"
+            "no seed below 3,000 exposed the figure 8 commit bug"
         );
     }
 
@@ -1043,6 +1202,15 @@ mod tests {
         assert!(
             matches!(found, Some((_, Violation::NotLinearizable { .. }))),
             "expected a history that is not linearizable, got {found:?}"
+        );
+    }
+
+    #[test]
+    fn compacting_the_log_before_the_state_machine_is_durable_is_caught() {
+        let found = first_safety_violation(Bug::CompactBeforeCheckpoint, 1_000);
+        assert!(
+            matches!(found, Some((_, Violation::StateLost { .. }))),
+            "expected a node that lost its state, got {found:?}"
         );
     }
 

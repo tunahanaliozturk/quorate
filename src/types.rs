@@ -151,6 +151,34 @@ impl PersistSeq {
     }
 }
 
+/// A point in the log that a snapshot covers: everything up to and including `index` is in the
+/// snapshot, and `term` is the term of the entry at `index`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SnapshotMeta {
+    index: Index,
+    term: Term,
+}
+
+impl SnapshotMeta {
+    /// Builds a snapshot point.
+    #[must_use]
+    pub const fn new(index: Index, term: Term) -> Self {
+        Self { index, term }
+    }
+
+    /// The last index the snapshot covers.
+    #[must_use]
+    pub const fn index(&self) -> Index {
+        self.index
+    }
+
+    /// The term of the entry at that index.
+    #[must_use]
+    pub const fn term(&self) -> Term {
+        self.term
+    }
+}
+
 /// Identifies one read request on one node. The driver chooses it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ReadId(u64);
@@ -205,16 +233,23 @@ impl LogWrite {
 pub struct Persist {
     seq: PersistSeq,
     hard_state: HardState,
+    base: Option<SnapshotMeta>,
     log: Option<LogWrite>,
 }
 
 impl Persist {
     /// Builds a persist request.
     #[must_use]
-    pub const fn new(seq: PersistSeq, hard_state: HardState, log: Option<LogWrite>) -> Self {
+    pub const fn new(
+        seq: PersistSeq,
+        hard_state: HardState,
+        base: Option<SnapshotMeta>,
+        log: Option<LogWrite>,
+    ) -> Self {
         Self {
             seq,
             hard_state,
+            base,
             log,
         }
     }
@@ -229,6 +264,13 @@ impl Persist {
     #[must_use]
     pub const fn hard_state(&self) -> HardState {
         self.hard_state
+    }
+
+    /// The new start of the log, if it moved: every stored entry up to and including this
+    /// index is to be removed. Applied before [`Persist::log`].
+    #[must_use]
+    pub const fn base(&self) -> Option<SnapshotMeta> {
+        self.base
     }
 
     /// The change to the log, if the log changed.
@@ -359,6 +401,25 @@ pub enum Input {
         /// Chosen by the driver, to match the answer to the read.
         id: ReadId,
     },
+    /// The state machine holds everything up to `index` durably, so the log before it may go.
+    /// The node never drops entries it has not handed out with [`Output::Apply`].
+    Compact {
+        /// The last index the log no longer needs to hold.
+        index: Index,
+    },
+    /// A snapshot arrived from the leader. The driver feeds this after it has installed the
+    /// snapshot into its state machine durably, or found that the state machine was already at
+    /// least as far.
+    Snapshot {
+        /// The leader that sent it.
+        from: NodeId,
+        /// The leader's term, as given in [`Output::SendSnapshot`].
+        term: Term,
+        /// The round given in [`Output::SendSnapshot`].
+        round: u64,
+        /// The point the snapshot covers.
+        snapshot: SnapshotMeta,
+    },
     /// The [`Persist`] request with this number, and every earlier one, is on stable storage.
     Persisted {
         /// The sequence number of the request that completed.
@@ -387,6 +448,17 @@ pub enum Output {
         index: Index,
         /// The committed entry.
         entry: Entry,
+    },
+    /// A follower needs entries the log no longer holds. The driver takes a snapshot of its
+    /// state machine as it is now and sends it; the receiving driver installs it and reports
+    /// with [`Input::Snapshot`]. The core never sees the data.
+    SendSnapshot {
+        /// The follower that needs it.
+        to: NodeId,
+        /// This node's term, to pass along.
+        term: Term,
+        /// The read round, to pass along.
+        round: u64,
     },
     /// The read may be served from the state machine as soon as it has applied `index`. The
     /// result is linearizable.

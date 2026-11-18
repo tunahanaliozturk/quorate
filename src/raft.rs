@@ -28,7 +28,7 @@ use crate::log::Log;
 use crate::rng::Rng;
 use crate::types::{
     AppendOutcome, Entry, HardState, Index, Input, LogWrite, Message, NodeId, Output, Payload,
-    Persist, PersistSeq, ReadId, Term,
+    Persist, PersistSeq, ReadId, SnapshotMeta, Term,
 };
 
 /// What a node currently is.
@@ -57,6 +57,9 @@ pub(crate) enum Bug {
     VoteWithoutLogCheck,
     /// Send messages without waiting for the state they depend on to be durable.
     SendBeforeDurable,
+    /// Not a rule of the core: the driver has the log compacted before the state machine is on
+    /// disk.
+    CompactBeforeCheckpoint,
     /// Answer a read without asking a quorum whether this node still leads.
     ReadWithoutQuorum,
     /// Start an election without asking first. Not a safety bug; used to show what pre-vote
@@ -76,6 +79,8 @@ struct Progress {
     acked_round: u64,
     /// Whether the follower has answered anything since the last quorum check.
     active: bool,
+    /// Ticks since a snapshot was asked for, while the follower needs one. `None` otherwise.
+    snapshot: Option<u32>,
 }
 
 /// A read waiting for a quorum to confirm that this node still leads.
@@ -133,6 +138,8 @@ pub struct Raft {
     hard_state_dirty: bool,
     /// The lowest log index that changed in this step.
     log_dirty_from: Option<Index>,
+    /// The start of the log moved in this step.
+    base_dirty: bool,
     /// The number of the last persist request issued.
     persist_seq: u64,
     /// The highest persist request reported durable.
@@ -157,29 +164,42 @@ impl Raft {
     /// peer twice, the heartbeat is not shorter than the election timeout, or the batch size is
     /// zero.
     pub fn new(config: Config) -> Result<Self, ConfigError> {
-        Self::recover(config, HardState::default(), Vec::new(), Index::ZERO)
+        let start = SnapshotMeta::default();
+        Self::recover(config, HardState::default(), start, Vec::new(), start)
     }
 
     /// Restarts a node from what its storage held. It comes back as a follower.
     ///
-    /// `log` must be exactly the durable log, with the entry for index 1 first. `applied` is how
-    /// far the state machine got. Those entries were committed, so the node starts with its
-    /// commit index there and emits [`Output::Apply`] from the entry after it.
+    /// `base` and `entries` are the durable log: the point it starts after, and the entries from
+    /// there on. `applied` is how far the state machine got. Those entries were committed, so the
+    /// node starts with its commit index there and emits [`Output::Apply`] from the entry after
+    /// it.
+    ///
+    /// The log may not agree with the state machine. That happens when a snapshot was installed
+    /// and the node went down before its log was rewritten to match: the state machine is at the
+    /// snapshot, and the log is still the old one, too short or gone another way. The test is the
+    /// term at the state machine's position. If the log holds a different one, or none, it starts
+    /// over after that position; nothing the old log held is needed any more.
     ///
     /// # Errors
     ///
     /// Returns a [`ConfigError`] for the same reasons as [`Raft::new`], and
-    /// [`ConfigError::AppliedPastLog`] when `applied` is beyond the end of `log`.
+    /// [`ConfigError::StateBehindLog`] when the log starts after `applied`.
     pub fn recover(
         config: Config,
         hard_state: HardState,
-        log: Vec<Entry>,
-        applied: Index,
+        base: SnapshotMeta,
+        entries: Vec<Entry>,
+        applied: SnapshotMeta,
     ) -> Result<Self, ConfigError> {
         config.validate()?;
-        let log = Log::from_entries(log);
-        if applied > log.last_index() {
-            return Err(ConfigError::AppliedPastLog);
+        if applied.index() < base.index() {
+            return Err(ConfigError::StateBehindLog);
+        }
+        let mut log = Log::from_parts(base, entries);
+        let start_over = log.term_at(applied.index()) != Some(applied.term());
+        if start_over {
+            log.reset(applied);
         }
         let mut node = Self {
             id: config.id,
@@ -192,13 +212,15 @@ impl Raft {
             voted_for: hard_state.voted_for(),
             durable_index: log.last_index(),
             log,
-            commit: applied,
-            applied,
+            commit: applied.index(),
+            applied: applied.index(),
             state: State::Follower { leader: None },
             elapsed: 0,
             timeout: 0,
             hard_state_dirty: false,
-            log_dirty_from: None,
+            // A log that started over is written out with the first step.
+            log_dirty_from: start_over.then(|| applied.index().next()),
+            base_dirty: start_over,
             persist_seq: 0,
             durable_seq: 0,
             in_flight: VecDeque::new(),
@@ -219,6 +241,18 @@ impl Raft {
             Input::Message { from, message } => self.receive(from, message, &mut produced),
             Input::Propose(command) => self.propose(command, &mut produced),
             Input::Read { id } => self.read(id, &mut produced),
+            Input::Compact { index } => self.compact(index),
+            Input::Snapshot {
+                from,
+                term,
+                round,
+                snapshot,
+            } => {
+                if term > self.term {
+                    self.become_follower(term, None, &mut produced);
+                }
+                self.on_snapshot(from, term, round, snapshot, &mut produced);
+            }
             Input::Persisted { seq } => self.on_persisted(seq, &mut out),
         }
         if let Some(persist) = self.take_persist() {
@@ -268,11 +302,30 @@ impl Raft {
         self.commit
     }
 
-    /// The whole in-memory log. The entry at index `i` is at position `i - 1`. The tail may not
-    /// be durable yet.
+    /// The last index the node has handed out with [`Output::Apply`], or taken over from a
+    /// snapshot. The log can be compacted up to here and no further.
+    #[must_use]
+    pub const fn applied_index(&self) -> Index {
+        self.applied
+    }
+
+    /// The entries the node holds in memory, starting right after [`Raft::log_base`]. The tail
+    /// may not be durable yet.
     #[must_use]
     pub fn log(&self) -> &[Entry] {
         self.log.entries()
+    }
+
+    /// The point the log starts after. Everything up to it is in a snapshot.
+    #[must_use]
+    pub const fn log_base(&self) -> SnapshotMeta {
+        self.log.base()
+    }
+
+    /// The index of the last entry in the log.
+    #[must_use]
+    pub fn last_log_index(&self) -> Index {
+        self.log.last_index()
     }
 
     #[cfg(test)]
@@ -333,19 +386,19 @@ impl Raft {
     /// The persist request for what this step changed, if it changed anything.
     fn take_persist(&mut self) -> Option<Persist> {
         let dirty_from = self.log_dirty_from.take();
-        if !self.hard_state_dirty && dirty_from.is_none() {
+        let base_moved = core::mem::take(&mut self.base_dirty);
+        if !self.hard_state_dirty && !base_moved && dirty_from.is_none() {
             return None;
         }
         self.hard_state_dirty = false;
         self.persist_seq += 1;
         self.in_flight
             .push_back((self.persist_seq, self.log.last_index()));
-        let log =
-            dirty_from.map(|first| LogWrite::new(first, self.log.slice_from(first, usize::MAX)));
         Some(Persist::new(
             PersistSeq::new(self.persist_seq),
             HardState::new(self.term, self.voted_for),
-            log,
+            base_moved.then(|| self.log.base()),
+            dirty_from.map(|first| LogWrite::new(first, self.log.slice_from(first, usize::MAX))),
         ))
     }
 
@@ -410,6 +463,7 @@ impl Raft {
 
     fn leader_tick(&mut self, out: &mut Vec<Output>) {
         let quorum = self.quorum();
+        let patience = self.election_ticks.saturating_mul(2);
         let State::Leader {
             progress,
             since_heartbeat,
@@ -419,6 +473,14 @@ impl Raft {
         else {
             return;
         };
+        // A snapshot that has not been acknowledged for two election timeouts was probably lost.
+        // Forget that it was asked for, so the next heartbeat asks again.
+        for follower in progress.iter_mut() {
+            follower.snapshot = follower
+                .snapshot
+                .map(|waited| waited + 1)
+                .filter(|&waited| waited < patience);
+        }
         // Check-quorum: a leader that has heard from fewer than a quorum for a whole election
         // timeout is cut off. Its followers have given up on it or soon will, so it stops
         // accepting work it could never commit.
@@ -584,6 +646,7 @@ impl Raft {
                 matched: Index::ZERO,
                 acked_round: 0,
                 active: false,
+                snapshot: None,
             })
             .collect();
         self.state = State::Leader {
@@ -789,6 +852,18 @@ impl Raft {
 
     // ---- Replication. ----
 
+    /// The answer to an append that does not fit this node's log, with a hint for the leader.
+    fn refusal(&self, prev_log_index: Index) -> AppendOutcome {
+        AppendOutcome::Rejected {
+            prev_log_index,
+            retry_from: if prev_log_index > self.log.last_index() {
+                self.log.last_index().next()
+            } else {
+                self.log.first_index_of_term(prev_log_index)
+            },
+        }
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "the fields of one message, taken apart by the caller"
@@ -797,28 +872,38 @@ impl Raft {
         &mut self,
         from: NodeId,
         term: Term,
-        prev_log_index: Index,
-        prev_log_term: Term,
-        entries: Vec<Entry>,
+        mut prev_log_index: Index,
+        mut prev_log_term: Term,
+        mut entries: Vec<Entry>,
         leader_commit: Index,
         out: &mut Vec<Output>,
     ) -> AppendOutcome {
-        let rejected = |log: &Log| AppendOutcome::Rejected {
-            prev_log_index,
-            retry_from: if prev_log_index > log.last_index() {
-                log.last_index().next()
-            } else {
-                log.first_index_of_term(prev_log_index)
-            },
-        };
         if term < self.term {
             // From a deposed leader. The term in our answer makes it step down.
-            return rejected(&self.log);
+            return self.refusal(prev_log_index);
         }
         self.become_follower(term, Some(from), out);
         self.reset_timer();
+
+        // A late message can start inside what this node has already folded into a snapshot.
+        // Those entries are committed, so they are the leader's entries by definition: skip them
+        // and start at the base.
+        let base = self.log.base();
+        if prev_log_index < base.index() {
+            let covered = base.index().get() - prev_log_index.get();
+            let covered = usize::try_from(covered).unwrap_or(usize::MAX);
+            if covered >= entries.len() {
+                let length = u64::try_from(entries.len()).unwrap_or(u64::MAX);
+                return AppendOutcome::Accepted {
+                    match_index: Index::new(prev_log_index.get().saturating_add(length)),
+                };
+            }
+            entries.drain(..covered);
+            prev_log_index = base.index();
+            prev_log_term = base.term();
+        }
         if self.log.term_at(prev_log_index) != Some(prev_log_term) {
-            return rejected(&self.log);
+            return self.refusal(prev_log_index);
         }
 
         let mut index = prev_log_index;
@@ -874,6 +959,8 @@ impl Raft {
             AppendOutcome::Accepted { match_index } => {
                 follower.matched = match_index;
                 follower.next = follower.next.max(match_index.next());
+                // Whatever it was waiting for, entries or a snapshot, has arrived.
+                follower.snapshot = None;
                 follower.next <= last
             }
             // An answer to a probe we have already moved on from.
@@ -896,18 +983,14 @@ impl Raft {
                 moved_back
             }
         };
-        let next = follower.next;
         self.advance_commit();
         self.confirm_reads(out);
         if send_more {
-            out.push(Output::Send {
-                to: from,
-                message: self.append_from(next),
-            });
+            self.replicate(Some(from), false, out);
         }
     }
 
-    /// The `AppendEntries` message for a follower whose next entry is `next`.
+    /// The `AppendEntries` message that continues the log at `next`, which the log must hold.
     fn append_from(&self, next: Index) -> Message {
         let prev_log_index = next.prev();
         let round = match self.state {
@@ -924,16 +1007,125 @@ impl Raft {
         }
     }
 
-    fn broadcast_append(&self, out: &mut Vec<Output>) {
-        let State::Leader { progress, .. } = &self.state else {
+    fn broadcast_append(&mut self, out: &mut Vec<Output>) {
+        self.replicate(None, true, out);
+    }
+
+    /// Sends one follower, or all of them, what they need next.
+    ///
+    /// A follower whose next entry is still in the log gets entries. One that needs entries the
+    /// log no longer holds gets a snapshot, asked for once and then waited on. On a heartbeat
+    /// such a follower is also sent an append it will refuse: the refusal still tells the leader
+    /// that the follower is there, and the message keeps the follower from starting an election
+    /// while the snapshot is on its way.
+    fn replicate(&mut self, only: Option<NodeId>, heartbeat: bool, out: &mut Vec<Output>) {
+        let base = self.log.base().index();
+        let term = self.term;
+        let State::Leader {
+            progress, round, ..
+        } = &mut self.state
+        else {
             return;
         };
-        for follower in progress {
-            out.push(Output::Send {
-                to: follower.peer,
-                message: self.append_from(follower.next),
-            });
+        let round = *round;
+        let mut plan = Vec::with_capacity(progress.len());
+        for follower in progress
+            .iter_mut()
+            .filter(|follower| only.is_none_or(|peer| peer == follower.peer))
+        {
+            let behind = follower.next <= base;
+            let ask = behind && follower.snapshot.is_none();
+            if ask {
+                follower.snapshot = Some(0);
+            }
+            plan.push((follower.peer, follower.next, behind, ask));
         }
+        for (peer, next, behind, ask) in plan {
+            if !behind {
+                out.push(Output::Send {
+                    to: peer,
+                    message: self.append_from(next),
+                });
+            } else if heartbeat {
+                out.push(Output::Send {
+                    to: peer,
+                    message: self.append_from(base.next()),
+                });
+            }
+            if ask {
+                out.push(Output::SendSnapshot {
+                    to: peer,
+                    term,
+                    round,
+                });
+            }
+        }
+    }
+
+    // ---- Snapshots. ----
+
+    /// Drops the log up to `index`. The driver calls this once its state machine holds everything
+    /// up to `index` durably, so the entries are no longer needed to rebuild it.
+    fn compact(&mut self, index: Index) {
+        // Never past what was applied: later entries have not reached the state machine.
+        let index = index.min(self.applied);
+        if index <= self.log.base().index() {
+            return;
+        }
+        self.log.compact_to(index);
+        self.base_dirty = true;
+    }
+
+    /// A snapshot arrived from the leader and the driver has put it into the state machine, if it
+    /// was newer than what the state machine held.
+    fn on_snapshot(
+        &mut self,
+        from: NodeId,
+        term: Term,
+        round: u64,
+        snapshot: SnapshotMeta,
+        out: &mut Vec<Output>,
+    ) {
+        let outcome = if term < self.term {
+            self.refusal(snapshot.index())
+        } else {
+            self.become_follower(term, Some(from), out);
+            self.reset_timer();
+            if snapshot.index() > self.applied {
+                if self.log.term_at(snapshot.index()) == Some(snapshot.term()) {
+                    // The log already holds the entry the snapshot ends with, so it agrees with
+                    // the leader up to there. Only the part the snapshot covers goes; what comes
+                    // after stays, and stays as durable as it was.
+                    self.log.compact_to(snapshot.index());
+                } else {
+                    // The log is too short or has gone another way. It starts over after the
+                    // snapshot.
+                    self.log.reset(snapshot);
+                    let first = snapshot.index().next();
+                    self.log_dirty_from =
+                        Some(self.log_dirty_from.map_or(first, |from| from.min(first)));
+                    // The new start is not on disk until the write below completes, and writes
+                    // still in flight must not be counted for entries that are gone.
+                    self.durable_index = self.durable_index.min(snapshot.index());
+                    for (_, last) in &mut self.in_flight {
+                        *last = (*last).min(snapshot.index());
+                    }
+                }
+                self.base_dirty = true;
+                self.commit = self.commit.max(snapshot.index());
+                self.applied = snapshot.index();
+            }
+            // Everything up to the snapshot is committed, so it matches the leader's log.
+            AppendOutcome::Accepted {
+                match_index: snapshot.index(),
+            }
+        };
+        let message = Message::AppendEntriesResponse {
+            term: self.term,
+            outcome,
+            round,
+        };
+        out.push(Output::Send { to: from, message });
     }
 
     /// Moves the commit index to the highest entry durably stored on a quorum.
@@ -986,8 +1178,11 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::{Bug, Raft, Role};
-    use crate::Config;
-    use crate::types::{Index, Input, Message, NodeId, Output, ReadId, Term};
+    use crate::types::{
+        AppendOutcome, Entry, HardState, Index, Input, Message, NodeId, Output, Payload, ReadId,
+        SnapshotMeta, Term,
+    };
+    use crate::{Config, ConfigError};
 
     #[test]
     fn a_single_node_commits_nothing_until_its_own_write_is_durable() {
@@ -1091,14 +1286,31 @@ mod tests {
         broken: Vec<(usize, usize)>,
         ready: Vec<ReadId>,
         rejected: Vec<ReadId>,
+        /// Snapshots a leader asked its driver to send, as (leader, follower).
+        asked: Vec<(usize, NodeId)>,
+        /// With a manual network, messages wait in the mailbox until the test delivers them.
+        manual: bool,
+        mailbox: Vec<(usize, usize, Message)>,
     }
 
     impl Cluster {
+        /// A cluster whose messages go nowhere until the test delivers them, and whose leaders
+        /// send one entry per message, so that a test can stop between two entries.
+        fn manual(size: u64, bug: Option<Bug>) -> Self {
+            let mut cluster = Self::with_batch(size, bug, 1);
+            cluster.manual = true;
+            cluster
+        }
+
         fn new(size: u64, bug: Option<Bug>) -> Self {
+            Self::with_batch(size, bug, 64)
+        }
+
+        fn with_batch(size: u64, bug: Option<Bug>, max_batch: usize) -> Self {
             let nodes: Vec<Raft> = (1..=size)
                 .map(|id| {
                     let peers = (1..=size).filter(|&peer| peer != id).map(NodeId::new);
-                    let config = Config::new(NodeId::new(id), peers, id);
+                    let config = Config::new(NodeId::new(id), peers, id).max_batch(max_batch);
                     let mut node = Raft::new(config).expect("a valid configuration");
                     if let Some(bug) = bug {
                         node.inject(bug);
@@ -1113,6 +1325,9 @@ mod tests {
                 broken: Vec::new(),
                 ready: Vec::new(),
                 rejected: Vec::new(),
+                asked: Vec::new(),
+                manual: false,
+                mailbox: Vec::new(),
             }
         }
 
@@ -1135,6 +1350,10 @@ mod tests {
                         }
                         Output::Send { to, message } => {
                             let to = self.position(to);
+                            if self.manual {
+                                self.mailbox.push((node, to, message));
+                                continue;
+                            }
                             let broken = self.broken.contains(&(node, to));
                             if !self.cut_off[node] && !self.cut_off[to] && !broken {
                                 queue.push_back((to, Input::Message { from, message }));
@@ -1142,10 +1361,38 @@ mod tests {
                         }
                         Output::ReadReady { id, .. } => self.ready.push(id),
                         Output::ReadRejected { id, .. } => self.rejected.push(id),
+                        Output::SendSnapshot { to, .. } => self.asked.push((node, to)),
                         Output::Apply { .. } | Output::NotLeader { .. } => {}
                     }
                 }
             }
+        }
+
+        /// Ticks one node only.
+        fn run_one(&mut self, node: usize, ticks: u32) {
+            for _ in 0..ticks {
+                self.feed(node, Input::Tick);
+            }
+        }
+
+        /// Delivers up to `limit` of the waiting messages that `wanted` picks, and the messages
+        /// those cause, in order. Whatever is left afterwards is lost.
+        fn deliver(&mut self, limit: usize, wanted: impl Fn(usize, usize, &Message) -> bool) {
+            let mut delivered = 0;
+            while delivered < limit {
+                let Some(position) = self
+                    .mailbox
+                    .iter()
+                    .position(|(from, to, message)| wanted(*from, *to, message))
+                else {
+                    break;
+                };
+                let (from, to, message) = self.mailbox.remove(position);
+                let from = self.nodes[from].id();
+                self.feed(to, Input::Message { from, message });
+                delivered += 1;
+            }
+            self.mailbox.clear();
         }
 
         fn run(&mut self, ticks: u32) {
@@ -1331,5 +1578,381 @@ mod tests {
             leader: Some(NodeId::new(1)),
         };
         assert_eq!(answers, [&refused]);
+    }
+
+    fn point(index: u64, term: u64) -> SnapshotMeta {
+        SnapshotMeta::new(Index::new(index), Term::new(term))
+    }
+
+    fn noops(term: u64, count: usize) -> Vec<Entry> {
+        vec![Entry::new(Term::new(term), Payload::Noop); count]
+    }
+
+    /// A follower in a cluster of three, restarted from the given storage.
+    fn follower(base: SnapshotMeta, entries: Vec<Entry>, applied: SnapshotMeta) -> Raft {
+        let config = Config::new(NodeId::new(1), [NodeId::new(2), NodeId::new(3)], 1);
+        let hard_state = HardState::new(Term::new(1), None);
+        Raft::recover(config, hard_state, base, entries, applied).expect("consistent storage")
+    }
+
+    /// Feeds an input and reports every write as durable at once. Returns everything the node
+    /// asked for.
+    fn settle(node: &mut Raft, input: Input) -> Vec<Output> {
+        let mut outputs = Vec::new();
+        let mut inputs = VecDeque::from([input]);
+        while let Some(input) = inputs.pop_front() {
+            for output in node.step(input) {
+                if let Output::Persist(request) = &output {
+                    inputs.push_back(Input::Persisted { seq: request.seq() });
+                }
+                outputs.push(output);
+            }
+        }
+        outputs
+    }
+
+    fn append(prev: u64, entries: Vec<Entry>, leader_commit: u64) -> Input {
+        let message = Message::AppendEntries {
+            term: Term::new(1),
+            prev_log_index: Index::new(prev),
+            prev_log_term: Term::new(1),
+            entries,
+            leader_commit: Index::new(leader_commit),
+            round: 0,
+        };
+        Input::Message {
+            from: NodeId::new(2),
+            message,
+        }
+    }
+
+    /// The outcome in the one answer the node sent.
+    fn answer(outputs: &[Output]) -> AppendOutcome {
+        let outcomes: Vec<AppendOutcome> = outputs
+            .iter()
+            .filter_map(|output| match output {
+                Output::Send {
+                    message: Message::AppendEntriesResponse { outcome, .. },
+                    ..
+                } => Some(*outcome),
+                _ => None,
+            })
+            .collect();
+        let [outcome] = outcomes.as_slice() else {
+            panic!("expected one answer, got {outputs:?}");
+        };
+        *outcome
+    }
+
+    #[test]
+    fn a_follower_that_fell_behind_the_compacted_log_is_sent_a_snapshot() {
+        let mut cluster = Cluster::new(3, None);
+        cluster.run(60);
+        let leader = cluster.leader();
+        let behind = (leader + 1) % 3;
+
+        cluster.cut_off[behind] = true;
+        for command in 0..5_u8 {
+            cluster.feed(leader, Input::Propose(vec![command]));
+        }
+        let committed = cluster.nodes[leader].commit_index();
+        assert_eq!(committed, Index::new(6), "the no-op and five commands");
+        cluster.feed(leader, Input::Compact { index: committed });
+        assert_eq!(cluster.nodes[leader].log_base().index(), committed);
+        assert_eq!(cluster.nodes[leader].log(), []);
+
+        // Back in touch, the follower needs entries the leader no longer has.
+        cluster.cut_off[behind] = false;
+        cluster.run(3);
+        let target = cluster.nodes[behind].id();
+        assert_eq!(
+            cluster.asked,
+            [(leader, target)],
+            "one snapshot, asked for once"
+        );
+        assert_eq!(cluster.nodes[behind].last_log_index(), Index::new(1));
+
+        // The driver's part: the snapshot reaches the follower's state machine, and the node is
+        // told where it now stands.
+        let snapshot = cluster.nodes[leader].log_base();
+        let term = cluster.nodes[leader].term();
+        let from = cluster.nodes[leader].id();
+        cluster.feed(
+            behind,
+            Input::Snapshot {
+                from,
+                term,
+                round: 0,
+                snapshot,
+            },
+        );
+        assert_eq!(cluster.nodes[behind].log_base(), snapshot);
+        assert_eq!(cluster.nodes[behind].commit_index(), committed);
+
+        // From there it follows the log again.
+        cluster.feed(leader, Input::Propose(b"after".to_vec()));
+        cluster.run(3);
+        assert_eq!(cluster.nodes[behind].last_log_index(), Index::new(7));
+        assert_eq!(cluster.nodes[behind].commit_index(), Index::new(7));
+        assert_eq!(cluster.asked.len(), 1);
+    }
+
+    #[test]
+    fn the_log_is_never_compacted_past_what_was_applied() {
+        let mut node =
+            Raft::new(Config::new(NodeId::new(1), [], 1)).expect("a valid configuration");
+        for _ in 0..20 {
+            settle(&mut node, Input::Tick);
+        }
+        assert_eq!(node.commit_index(), Index::new(1));
+        // Proposed, and its write still in flight: in the log, not applied.
+        node.step(Input::Propose(b"pending".to_vec()));
+        assert_eq!(node.last_log_index(), Index::new(2));
+
+        node.step(Input::Compact {
+            index: Index::new(2),
+        });
+        assert_eq!(node.log_base().index(), Index::new(1));
+        assert_eq!(node.log().len(), 1);
+    }
+
+    #[test]
+    fn a_restart_with_the_state_machine_ahead_of_the_log_starts_the_log_over() {
+        // A snapshot up to index 5 was installed, and the power went before the log caught up.
+        let mut node = follower(SnapshotMeta::default(), noops(1, 2), point(5, 1));
+        assert_eq!(node.log_base(), point(5, 1));
+        assert_eq!(node.log(), []);
+        assert_eq!(node.commit_index(), Index::new(5));
+
+        // The first thing the node does is put the new start of its log on disk.
+        let outputs = node.step(Input::Tick);
+        let [Output::Persist(write)] = outputs.as_slice() else {
+            panic!("expected one write, got {outputs:?}");
+        };
+        assert_eq!(write.base(), Some(point(5, 1)));
+        let log = write.log().expect("the old entries are replaced");
+        assert_eq!((log.first_index(), log.entries().len()), (Index::new(6), 0));
+    }
+
+    #[test]
+    fn a_restart_with_the_log_ahead_of_the_state_machine_is_refused() {
+        let config = Config::new(NodeId::new(1), [], 1);
+        let result = Raft::recover(
+            config,
+            HardState::default(),
+            point(5, 1),
+            Vec::new(),
+            point(3, 1),
+        );
+        assert_eq!(result.err(), Some(ConfigError::StateBehindLog));
+    }
+
+    #[test]
+    fn a_late_append_that_starts_inside_the_snapshot_is_matched_from_the_base() {
+        let mut node = follower(point(5, 1), Vec::new(), point(5, 1));
+
+        // Entirely inside the snapshot: nothing to store, and it all matches.
+        let outputs = settle(&mut node, append(2, noops(1, 3), 5));
+        assert_eq!(
+            answer(&outputs),
+            AppendOutcome::Accepted {
+                match_index: Index::new(5)
+            }
+        );
+        assert_eq!(node.last_log_index(), Index::new(5));
+
+        // Straddling the base: the part after it is stored.
+        let outputs = settle(&mut node, append(3, noops(1, 4), 5));
+        assert_eq!(
+            answer(&outputs),
+            AppendOutcome::Accepted {
+                match_index: Index::new(7)
+            }
+        );
+        assert_eq!(node.log().len(), 2);
+    }
+
+    #[test]
+    fn a_snapshot_that_is_not_ahead_changes_nothing_and_is_still_acknowledged() {
+        let mut node = follower(SnapshotMeta::default(), noops(1, 6), point(6, 1));
+        let input = Input::Snapshot {
+            from: NodeId::new(2),
+            term: Term::new(1),
+            round: 4,
+            snapshot: point(4, 1),
+        };
+        let outputs = settle(&mut node, input);
+
+        assert_eq!(
+            answer(&outputs),
+            AppendOutcome::Accepted {
+                match_index: Index::new(4)
+            }
+        );
+        assert_eq!(node.log_base(), SnapshotMeta::default());
+        assert_eq!(node.log().len(), 6);
+    }
+
+    fn is_vote(message: &Message) -> bool {
+        matches!(
+            message,
+            Message::PreVote { .. }
+                | Message::PreVoteResponse { .. }
+                | Message::RequestVote { .. }
+                | Message::RequestVoteResponse { .. }
+        )
+    }
+
+    /// Runs an election by hand in a cluster with a manual network: `candidate` can reach only
+    /// `voters`, and only election messages get through. Everything else is lost, including the
+    /// first entries of the new leader.
+    fn elect(cluster: &mut Cluster, candidate: usize, voters: &[usize]) {
+        // The voters have to be out of patience with whoever they followed, or they refuse.
+        for &voter in voters {
+            for _ in 0..10 {
+                cluster.feed(voter, Input::Tick);
+            }
+        }
+        cluster.mailbox.clear();
+        let reachable = |from: usize, to: usize, message: &Message| {
+            let pair = (from == candidate && voters.contains(&to))
+                || (to == candidate && voters.contains(&from));
+            pair && is_vote(message)
+        };
+        // A node that still believes it leads an old term first has to notice that it does not,
+        // so being leader is not enough: it has to be leader of a new term.
+        let before = cluster.nodes[candidate].term();
+        let won = |cluster: &Cluster| {
+            let node = &cluster.nodes[candidate];
+            node.role() == Role::Leader && node.term() > before
+        };
+        for _ in 0..300 {
+            if won(cluster) && cluster.mailbox.is_empty() {
+                break;
+            }
+            cluster.feed(candidate, Input::Tick);
+            cluster.deliver(usize::MAX, reachable);
+        }
+        assert!(won(cluster), "the election did not finish");
+    }
+
+    /// Figure 8 of the Raft paper, step by step, on five nodes A to E.
+    ///
+    /// An entry from an old term reaches a majority while its leader is in a newer term. Counting
+    /// replicas says it is committed. It is not: a node that never saw it can still be elected
+    /// and overwrite it. Raft therefore commits only entries of the leader's own term by
+    /// counting, and with them everything before.
+    ///
+    /// The second run removes that rule and shows the entry being acknowledged and then lost.
+    #[test]
+    fn an_entry_of_an_earlier_term_is_not_committed_by_counting_replicas() {
+        const A: usize = 0;
+        const B: usize = 1;
+        const C: usize = 2;
+        const D: usize = 3;
+        const E: usize = 4;
+        let only = |x: usize, y: usize| {
+            move |from: usize, to: usize, _: &Message| (from, to) == (x, y) || (from, to) == (y, x)
+        };
+
+        for (bug, lost) in [(None, false), (Some(Bug::CommitEarlierTerm), true)] {
+            let mut cluster = Cluster::manual(5, bug);
+
+            // (a) A leads and gets its entry onto B, no further.
+            elect(&mut cluster, A, &[B, C]);
+            let first_term = cluster.nodes[A].term();
+            cluster.run_one(A, 2);
+            cluster.deliver(usize::MAX, only(A, B));
+            assert_eq!(cluster.nodes[B].last_log_index(), Index::new(1));
+            assert_eq!(cluster.nodes[A].commit_index(), Index::ZERO);
+
+            // (b) A is cut off. E wins with C and D, and its own entry at index 1 stays on E.
+            elect(&mut cluster, E, &[C, D]);
+            assert!(cluster.nodes[E].term() > first_term);
+
+            // (c) E is cut off. A wins again with B and C, and brings C up to date one entry at a
+            // time. C takes A's old entry, and the exchange stops before the entry of A's new
+            // term reaches it: a refusal, the old entry, its acknowledgement.
+            elect(&mut cluster, A, &[B, C]);
+            cluster.run_one(A, 2);
+            cluster.deliver(4, only(A, C));
+            assert_eq!(cluster.nodes[C].last_log_index(), Index::new(1));
+            assert_eq!(cluster.nodes[C].log()[0].term(), first_term);
+            // B acknowledges the new entry. Now A, B and C hold the old entry: a majority. Only A
+            // and B hold an entry of A's current term: not a majority.
+            cluster.run_one(A, 2);
+            cluster.deliver(usize::MAX, only(A, B));
+            assert_eq!(cluster.nodes[B].last_log_index(), Index::new(2));
+
+            let acknowledged = cluster.nodes[A].commit_index() == Index::new(1);
+            assert_eq!(
+                acknowledged,
+                lost,
+                "with {bug:?}, A's commit index is {:?}",
+                cluster.nodes[A].commit_index()
+            );
+
+            // (d) A is cut off. E can win with C and D: its log ends in a newer term than theirs.
+            // As leader it replaces C's copy of the old entry with its own.
+            elect(&mut cluster, E, &[C, D]);
+            cluster.run_one(E, 2);
+            cluster.deliver(usize::MAX, only(E, C));
+            assert_ne!(
+                cluster.nodes[C].log()[0].term(),
+                first_term,
+                "E overwrote the old entry on C"
+            );
+            // Without the rule, an entry A reported as committed is now gone from a majority,
+            // and the leader does not have it. With the rule nothing was promised.
+        }
+    }
+
+    #[test]
+    fn a_restart_with_a_log_that_went_another_way_starts_the_log_over() {
+        // The state machine holds a snapshot up to index 4, whose last entry was of term 2. The
+        // log on disk is longer than that, and holds an entry of term 1 at index 4: it is the log
+        // from before the snapshot, and the write that would have replaced it was lost.
+        let node = follower(SnapshotMeta::default(), noops(1, 6), point(4, 2));
+        assert_eq!(node.log_base(), point(4, 2));
+        assert_eq!(node.log(), []);
+    }
+
+    #[test]
+    fn a_snapshot_that_ends_inside_a_matching_log_keeps_the_entries_after_it() {
+        let mut node = follower(SnapshotMeta::default(), noops(1, 6), point(2, 1));
+        let input = Input::Snapshot {
+            from: NodeId::new(2),
+            term: Term::new(1),
+            round: 0,
+            snapshot: point(4, 1),
+        };
+        let outputs = settle(&mut node, input);
+
+        assert_eq!(
+            answer(&outputs),
+            AppendOutcome::Accepted {
+                match_index: Index::new(4)
+            }
+        );
+        assert_eq!(node.log_base(), point(4, 1));
+        assert_eq!(node.log().len(), 2);
+        assert_eq!(node.applied_index(), Index::new(4));
+    }
+
+    #[test]
+    fn a_snapshot_the_log_disagrees_with_replaces_the_whole_log() {
+        let mut node = follower(SnapshotMeta::default(), noops(1, 6), point(2, 1));
+        // Index 4 in the snapshot is of term 3; the log has term 1 there.
+        let input = Input::Snapshot {
+            from: NodeId::new(2),
+            term: Term::new(3),
+            round: 0,
+            snapshot: point(4, 3),
+        };
+        settle(&mut node, input);
+
+        assert_eq!(node.log_base(), point(4, 3));
+        assert_eq!(node.log(), []);
+        assert_eq!(node.commit_index(), Index::new(4));
     }
 }

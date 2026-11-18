@@ -59,6 +59,12 @@ The core does not wait for the disk. It emits `Output::Persist` with a sequence 
 
 katman is not yet published on crates.io. Until it is, quorate depends on it by git revision.
 
+### Snapshots and log compaction
+
+There is no snapshot file: the state database is the snapshot. Compacting the log means forcing the state database to disk and then dropping the log up to the index that is now durable. A follower that needs entries the leader no longer holds is sent every row of the leader's state database, installs them in one atomic batch, and continues from the log after that. The core never sees the data, only the index and term a snapshot ends with.
+
+The state machine always becomes durable before the log is cut. A node that restarts in between finds a log that disagrees with its state machine, tells by the term at the state machine's position, and starts its log over after it. See [ADR 0005](adr/0005-the-state-database-is-the-snapshot.md).
+
 ### Client sessions
 
 A client picks a random 64-bit session id. Each request carries the session id and a sequence number, and a session has one request in flight at a time. The state machine stores the highest sequence number and its reply per session. A request with that same number gets the stored reply; one with a lower number is ignored. Without this, a retry after a lost reply would apply twice and break linearizability.
@@ -89,6 +95,7 @@ Faults:
 - Partitions: symmetric, one-way, and a leader isolated from the majority.
 - Power cuts. The node loses its memory and every write that had not completed. Storage runs on katman's `SimFs`, which discards unsynced bytes; the node restarts later from what the database holds.
 - Slow disks: a write completes some ticks after it was requested, in request order.
+- Log compaction: every few applied entries a node checkpoints its state machine and drops the log before it, so followers that fall behind need snapshots. Often a node loses power right after it installed one.
 - Clients: requests and replies are lost, a client that waits too long sends the same request to another node, and old requests are sent again at random.
 - Bytes that are not a request are proposed, to check that every node ignores them the same way.
 - Clock drift: now and then a node ticks only half or a fifth of the time, and a leader that is cut off often slows to a tenth.
@@ -105,6 +112,7 @@ Checks, every 32 ticks and at the end (they compare whole logs, which is too slo
 
 - **Log matching**: two logs with the same index and term agree on everything before it.
 - **Committed entries stay**: the committed part of every node's log equals the record of applied entries.
+- **Bounded log**: no node holds more applied entries in its log than the compaction policy allows.
 
 Checks, at the end of a run:
 
@@ -122,6 +130,7 @@ A simulator that never fails proves nothing. The test suite includes known-wrong
 - Grant a vote without checking that the candidate's log is up to date.
 - Acknowledge an append before it is durable.
 - Carry out a retried request a second time.
+- Compact the log before the state machine is on disk.
 - Answer a read from a leader that has not confirmed its leadership.
 
 ## Errors

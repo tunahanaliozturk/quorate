@@ -50,9 +50,9 @@ mod types;
 pub use config::{Config, ConfigError};
 pub use kv::{Op, Reply, Request, SessionId};
 pub use raft::{Raft, Role};
-pub use state::{Outcome, StateMachine};
+pub use state::{Outcome, Snapshot, StateMachine};
 pub use storage::{Recovered, Storage, StorageError};
 pub use types::{
     AppendOutcome, Entry, HardState, Index, Input, LogWrite, Message, NodeId, Output, Payload,
-    Persist, PersistSeq, ReadId, Term,
+    Persist, PersistSeq, ReadId, SnapshotMeta, Term,
 };

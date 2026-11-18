@@ -1,0 +1,33 @@
+name: sweep
+
+# The test suite runs 10,000 simulator seeds on every push. Some bugs are rarer than that: one
+# showed three times in 50,000 seeds and never in 10,000. This job runs many more, once a week.
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: Number of seeds
+        default: "200000"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run the simulator over many seeds
+        env:
+          QUORATE_SEEDS: ${{ inputs.seeds || '200000' }}
+        run: cargo test every_seed
