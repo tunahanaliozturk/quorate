@@ -9,6 +9,7 @@
 //! code it does not run: the wire format, the sockets, the threads, the real filesystem and the
 //! process actually dying.
 
+use std::hash::{BuildHasher, RandomState};
 use std::io;
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
@@ -27,6 +28,26 @@ const KEYS: u8 = 2;
 /// Few values, so that a compare-and-set often finds what it expects.
 const VALUES: u64 = 3;
 const KILLS: usize = 4;
+
+/// A new directory under the system's temporary directory, for this run alone.
+///
+/// The name cannot be guessed, the directory must not exist yet, and on Unix only its owner can
+/// enter it. A fixed name in a shared temporary directory could be prepared by someone else:
+/// as a link to somewhere this process would then write, or as a directory they can read.
+fn fresh_dir(prefix: &str) -> io::Result<PathBuf> {
+    let unique = RandomState::new().hash_one(std::process::id());
+    let dir = std::env::temp_dir().join(format!("{prefix}-{unique:016x}"));
+    let builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    let builder = {
+        let mut builder = builder;
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder
+    };
+    // Not recursive, so it fails if anything is already there.
+    builder.create(&dir)?;
+    Ok(dir)
+}
 
 struct Cluster {
     dir: PathBuf,
@@ -47,10 +68,7 @@ impl Cluster {
         }
         drop(listeners);
 
-        let dir = std::env::temp_dir().join(format!("quorate-kill-{}", std::process::id()));
-        // Left over from a run that was itself killed, if at all.
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir)?;
+        let dir = fresh_dir("quorate-kill")?;
 
         let mut cluster = Self {
             dir,

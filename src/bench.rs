@@ -9,6 +9,7 @@
 //! machines.
 
 use core::time::Duration;
+use std::hash::{BuildHasher, RandomState};
 use std::io::{self, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
@@ -24,6 +25,26 @@ use crate::{Args, Failure, fail};
 /// Keys written before a read workload, and read back at random.
 const PRELOADED: u64 = 1_000;
 const VALUE: [u8; 100] = [7; 100];
+
+/// A new directory under the system's temporary directory, for this run alone.
+///
+/// The name cannot be guessed, the directory must not exist yet, and on Unix only its owner can
+/// enter it. A fixed name in a shared temporary directory could be prepared by someone else:
+/// as a link to somewhere this process would then write, or as a directory they can read.
+fn fresh_dir(prefix: &str) -> io::Result<PathBuf> {
+    let unique = RandomState::new().hash_one(std::process::id());
+    let dir = std::env::temp_dir().join(format!("{prefix}-{unique:016x}"));
+    let builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    let builder = {
+        let mut builder = builder;
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder
+    };
+    // Not recursive, so it fails if anything is already there.
+    builder.create(&dir)?;
+    Ok(dir)
+}
 
 struct Cluster {
     dir: PathBuf,
@@ -41,10 +62,7 @@ impl Cluster {
             listeners.push(listener);
         }
         drop(listeners);
-        let dir = std::env::temp_dir().join(format!("quorate-bench-{}", std::process::id()));
-        // Left over from a run that was interrupted, if at all.
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir)?;
+        let dir = fresh_dir("quorate-bench")?;
         let mut cluster = Self {
             dir,
             addresses,
