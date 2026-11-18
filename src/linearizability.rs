@@ -14,30 +14,44 @@ use std::collections::HashSet;
 
 /// What a client asked for. Values are small numbers; the simulator maps them to bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Call {
+pub enum Call {
+    /// Read the key.
     Get,
+    /// Set the key to a value.
     Put(u64),
+    /// Remove the key.
     Delete,
-    CompareAndSet { expected: Option<u64>, value: u64 },
+    /// Set the key to `value` if it holds `expected`; `None` means it must be absent.
+    CompareAndSet {
+        /// What the key must hold.
+        expected: Option<u64>,
+        /// What to write if it does.
+        value: u64,
+    },
 }
 
 /// What the client was told.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Return {
+pub enum Return {
+    /// What a get found; `None` if the key was absent.
     Value(Option<u64>),
+    /// A put or a delete was carried out.
     Done,
+    /// Whether a compare-and-set wrote its value.
     Swapped(bool),
 }
 
 /// One operation of a history. Times come from one counter shared by all clients, so no two
 /// events have the same time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Operation {
-    pub(crate) call: Call,
-    pub(crate) invoked: u64,
+pub struct Operation {
+    /// What was asked.
+    pub call: Call,
+    /// When the client sent it.
+    pub invoked: u64,
     /// When the client got its answer, and the answer. `None` if it never did: such an
     /// operation may have taken effect at any time after it was invoked, or not at all.
-    pub(crate) returned: Option<(u64, Return)>,
+    pub returned: Option<(u64, Return)>,
 }
 
 /// The store would not have answered that.
@@ -118,7 +132,8 @@ impl Search<'_> {
 }
 
 /// Whether the operations on one key, which starts out absent, are linearizable.
-pub(crate) fn linearizable(operations: &[Operation]) -> bool {
+#[must_use]
+pub fn linearizable(operations: &[Operation]) -> bool {
     let mut search = Search {
         operations,
         placed: vec![false; operations.len()],

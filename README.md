@@ -6,9 +6,40 @@ A meeting is *quorate* when enough members are present to make a binding decisio
 
 ## Status
 
-Milestones 1 to 6 of 8 are done: the Raft core with pre-vote and check-quorum, durable storage in katman, the key-value state machine with client sessions, reads that skip the log, log compaction with snapshots, membership changes, and the simulator that tests all of it. There is no network and no server yet, so this is not usable as a database.
+Milestones 1 to 7 of 8 are done. quorate runs: a `quorate` binary starts a node or talks to a cluster, over TCP, with data on disk. It is a study, not a product. There is no authentication and no encryption, and it has no benchmarks yet.
 
-What the simulator shows today, all reproducible with `cargo test`:
+## Try it
+
+```
+cargo build --release
+```
+
+Three nodes on one machine, each in its own terminal:
+
+```
+quorate serve --id 1 --listen 127.0.0.1:7001 --data data/1 --peer 1=127.0.0.1:7001 --peer 2=127.0.0.1:7002 --peer 3=127.0.0.1:7003
+quorate serve --id 2 --listen 127.0.0.1:7002 --data data/2 --peer 1=127.0.0.1:7001 --peer 2=127.0.0.1:7002 --peer 3=127.0.0.1:7003
+quorate serve --id 3 --listen 127.0.0.1:7003 --data data/3 --peer 1=127.0.0.1:7001 --peer 2=127.0.0.1:7002 --peer 3=127.0.0.1:7003
+```
+
+Then, with `S="--server 1=127.0.0.1:7001 --server 2=127.0.0.1:7002 --server 3=127.0.0.1:7003"`:
+
+```
+quorate status $S
+quorate put greeting hello $S
+quorate get greeting $S
+quorate cas greeting hello world $S
+```
+
+Kill the node that `status` shows as leader, with `kill -9` or the task manager. The other two elect a new one within a second or two, `get` still answers, and the node catches up when it is started again. A node is only ever stopped by killing it; there is no other way.
+
+`compose.yaml` starts the same three nodes in containers.
+
+## What is tested
+
+A real cluster under fire, in `tests/kill.rs`: three processes, four clients, the leader killed four times. About 9,000 operations per run are answered and their history is linearizable.
+
+The simulator, which is where most of the evidence comes from. All of it is reproducible with `cargo test`:
 
 - 10,000 seeds, each 1,500 ticks on a cluster of three or five nodes plus two spares, break no safety property. The faults are dropped, duplicated and delayed messages, changing partitions, slow disks, drifting clocks, power cuts, membership changes at random moments, and clients that lose requests and replies and send them again. A weekly job runs 200,000 seeds.
 - After the faults stop and every node is back, every seed converges on one fully committed log that holds every entry any node ever applied. No acknowledged entry is lost.

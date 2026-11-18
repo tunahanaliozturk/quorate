@@ -13,11 +13,19 @@ exclude = ["/.github", "/docs"]
 # Depends on katman by git revision, which crates.io does not accept.
 publish = false
 
+[features]
+# Exposes the linearizability checker, for tests that record what clients of a real cluster saw.
+testkit = []
+
 [dependencies]
+# Checksums on network frames.
+crc32c = "0.6.9"
 # Not on crates.io yet, so pinned to a commit. Move to a version once katman is published.
 katman = { version = "0.0.0", git = "https://github.com/tunahanaliozturk/katman", rev = "dd90433d0273ef0d7d87e228813afdb1e0f10f01" }
 
 [dev-dependencies]
+# The integration tests check their histories with the crate's own checker.
+quorate = { path = ".", features = ["testkit"] }
 # The simulator runs storage on katman's simulated filesystem.
 katman = { version = "0.0.0", git = "https://github.com/tunahanaliozturk/katman", rev = "dd90433d0273ef0d7d87e228813afdb1e0f10f01", features = ["sim"] }
 

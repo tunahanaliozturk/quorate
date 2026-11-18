@@ -23,7 +23,9 @@ dependencies = [
 name = "quorate"
 version = "0.0.0"
 dependencies = [
+ "crc32c",
  "katman",
+ "quorate",
 ]
 
 [[package]]

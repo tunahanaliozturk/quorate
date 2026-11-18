@@ -81,13 +81,13 @@ A read does not go through the log. The leader notes its commit index, has a quo
 
 A get can still be sent through the log like any other operation; the simulator does both.
 
-### Transport and wire format
+### Node, transport and wire format
 
-A `Transport` trait with two implementations: simulated (in-process queues owned by the simulator) and TCP on tokio. Frames are length-prefixed with a CRC32C. Message encoding is written by hand, with a version byte, and fuzzed.
+A `Node` ties the core, the storage and the state machine together and does no I/O: events in, effects out. The server around it is threads and blocking sockets: one thread owns the node, the others read and write frames. Frames are length, CRC32C and payload; messages are encoded by hand, and a connection opens with a magic number and a version. Decoding accepts a buffer only if it is exactly one value, and never allocates on the word of a length it has not checked. See [ADR 0007](adr/0007-threads-and-blocking-sockets.md).
 
 ### Server and client
 
-A `quorate` binary that runs one node, and a small client library plus CLI. The client follows leader redirects and retries with its session.
+One binary, `quorate`. `quorate serve` runs a node; it has no shutdown path and is stopped by killing it. The other commands are a client: `get`, `put`, `delete`, `cas`, `member` and `status`. The client keeps one connection to the node it believes leads, follows the hint when a node says who leads instead, and retries with the same session and sequence number.
 
 ## Simulation
 
@@ -156,4 +156,4 @@ No target numbers are claimed before they are measured.
 
 ## Dependencies
 
-Kept small and permissive: katman, crc32c, tokio (transport and server only, never in the core), proptest for tests. `cargo deny` checks licences and advisories in CI.
+Kept small and permissive: katman, and crc32c for frame checksums. No async runtime and no test framework beyond the standard one. `cargo deny` checks licences and advisories in CI.

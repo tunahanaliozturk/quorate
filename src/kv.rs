@@ -218,13 +218,13 @@ impl Reply {
     }
 }
 
-fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+pub(crate) fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     // A slice is never longer than `u64::MAX` bytes on any platform Rust supports.
     out.extend_from_slice(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
     out.extend_from_slice(bytes);
 }
 
-fn put_optional(out: &mut Vec<u8>, bytes: Option<&[u8]>) {
+pub(crate) fn put_optional(out: &mut Vec<u8>, bytes: Option<&[u8]>) {
     match bytes {
         None => out.push(0),
         Some(bytes) => {
@@ -234,26 +234,26 @@ fn put_optional(out: &mut Vec<u8>, bytes: Option<&[u8]>) {
     }
 }
 
-struct Malformed;
+pub(crate) struct Malformed;
 
 /// Reads fields off the front of a byte slice. Every method returns `None` instead of reading
 /// past the end.
-struct Reader<'a>(&'a [u8]);
+pub(crate) struct Reader<'a>(pub(crate) &'a [u8]);
 
 impl Reader<'_> {
-    fn u8(&mut self) -> Option<u8> {
+    pub(crate) fn u8(&mut self) -> Option<u8> {
         let (&first, rest) = self.0.split_first()?;
         self.0 = rest;
         Some(first)
     }
 
-    fn u64(&mut self) -> Option<u64> {
+    pub(crate) fn u64(&mut self) -> Option<u64> {
         let (head, rest) = self.0.split_first_chunk::<8>()?;
         self.0 = rest;
         Some(u64::from_be_bytes(*head))
     }
 
-    fn bytes(&mut self) -> Option<Vec<u8>> {
+    pub(crate) fn bytes(&mut self) -> Option<Vec<u8>> {
         let len = usize::try_from(self.u64()?).ok()?;
         let (head, rest) = self.0.split_at_checked(len)?;
         self.0 = rest;
@@ -261,7 +261,7 @@ impl Reader<'_> {
     }
 
     /// A value that may be absent. `Err` means the bytes are not a well-formed field.
-    fn optional(&mut self) -> Result<Option<Vec<u8>>, Malformed> {
+    pub(crate) fn optional(&mut self) -> Result<Option<Vec<u8>>, Malformed> {
         match self.u8() {
             Some(0) => Ok(None),
             Some(1) => self.bytes().map(Some).ok_or(Malformed),

@@ -33,6 +33,9 @@ pub struct Outcome {
     pub reply: Reply,
 }
 
+/// One key and its value, as the database holds them.
+pub(crate) type Row = (Vec<u8>, Vec<u8>);
+
 /// A copy of a whole state machine at one point of the log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
@@ -46,6 +49,23 @@ impl Snapshot {
     #[must_use]
     pub const fn meta(&self) -> SnapshotMeta {
         self.meta
+    }
+
+    /// The rows of a snapshot, with what they describe, for the wire format.
+    pub(crate) fn parts(&self) -> (SnapshotMeta, Option<&Membership>, &[Row]) {
+        (self.meta, self.membership.as_ref(), &self.rows)
+    }
+
+    pub(crate) const fn from_parts(
+        meta: SnapshotMeta,
+        membership: Option<Membership>,
+        rows: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Self {
+        Self {
+            meta,
+            membership,
+            rows,
+        }
     }
 
     /// The membership at that point, if the state machine it was taken from knew one.

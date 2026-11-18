@@ -1,0 +1,52 @@
+# Three nodes on one machine, each with its own volume.
+#
+#   docker compose up --build -d
+#   quorate status --server 1=127.0.0.1:7001 --server 2=127.0.0.1:7002 --server 3=127.0.0.1:7003
+#   docker compose kill node1        # the other two carry on
+#   docker compose up -d node1       # and it catches up
+#
+# The nodes have fixed addresses. A node is told where its peers are when it starts and does not
+# look them up again, so a name that resolves to a new address after a restart would not do.
+
+x-node: &node
+  build: .
+  restart: unless-stopped
+
+services:
+  node1:
+    <<: *node
+    command: [serve, --id, "1", --listen, 0.0.0.0:7000, --data, /var/lib/quorate, --peer, 1=172.28.0.11:7000, --peer, 2=172.28.0.12:7000, --peer, 3=172.28.0.13:7000]
+    networks:
+      quorate:
+        ipv4_address: 172.28.0.11
+    ports: ["7001:7000"]
+    volumes: [node1:/var/lib/quorate]
+
+  node2:
+    <<: *node
+    command: [serve, --id, "2", --listen, 0.0.0.0:7000, --data, /var/lib/quorate, --peer, 1=172.28.0.11:7000, --peer, 2=172.28.0.12:7000, --peer, 3=172.28.0.13:7000]
+    networks:
+      quorate:
+        ipv4_address: 172.28.0.12
+    ports: ["7002:7000"]
+    volumes: [node2:/var/lib/quorate]
+
+  node3:
+    <<: *node
+    command: [serve, --id, "3", --listen, 0.0.0.0:7000, --data, /var/lib/quorate, --peer, 1=172.28.0.11:7000, --peer, 2=172.28.0.12:7000, --peer, 3=172.28.0.13:7000]
+    networks:
+      quorate:
+        ipv4_address: 172.28.0.13
+    ports: ["7003:7000"]
+    volumes: [node3:/var/lib/quorate]
+
+networks:
+  quorate:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
+volumes:
+  node1:
+  node2:
+  node3:

@@ -233,7 +233,7 @@ pub(crate) fn decode_base(bytes: &[u8]) -> Result<SnapshotMeta, StorageError> {
     ))
 }
 
-fn encode_entry(entry: &Entry) -> Vec<u8> {
+pub(crate) fn encode_entry(entry: &Entry) -> Vec<u8> {
     let membership;
     let (kind, body): (u8, &[u8]) = match entry.payload() {
         Payload::Noop => (KIND_NOOP, &[]),
@@ -250,7 +250,7 @@ fn encode_entry(entry: &Entry) -> Vec<u8> {
     bytes
 }
 
-fn decode_entry(bytes: &[u8]) -> Result<Entry, StorageError> {
+pub(crate) fn decode_entry(bytes: &[u8]) -> Result<Entry, StorageError> {
     let corrupt = StorageError::Corrupt("a log entry has the wrong shape");
     let Some((term, rest)) = bytes.split_first_chunk::<8>() else {
         return Err(corrupt);

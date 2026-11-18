@@ -15,4 +15,4 @@ Security fixes go into the latest release only.
 - A message from a peer or a client that makes a node panic, hang or allocate without bound.
 - A sequence of crashes, partitions or message faults that loses an acknowledged write or returns a result that is not linearizable.
 
-Out of scope: nodes that deliberately send false messages. quorate assumes peers are honest and that the network between them is trusted; it has no authentication yet.
+Out of scope: nodes that deliberately send false messages, and anything that follows from the port being reachable by someone who should not reach it. quorate assumes peers are honest and the network is trusted. It has no authentication and no encryption: whoever can connect can read, write and change the membership.
