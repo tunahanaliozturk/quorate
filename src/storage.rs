@@ -131,38 +131,61 @@ impl Storage {
     /// Returns [`StorageError::Db`] when the write fails. The node must stop: its in-memory state
     /// is ahead of its disk and it cannot know by how much.
     pub fn persist(&mut self, persist: &Persist) -> Result<(), StorageError> {
-        let mut batch = WriteBatch::new();
-        batch.put(HARD_STATE_KEY, encode_hard_state(persist.hard_state()));
+        self.persist_all(core::slice::from_ref(persist))
+    }
 
+    /// Makes several persist requests durable with one write and one sync. They must be in the
+    /// order the node issued them. Afterwards the last of them, and so all of them, may be
+    /// reported to the node as durable.
+    ///
+    /// This is what lets many client requests share one fsync: the requests that arrive while
+    /// one write is on its way to disk go out together in the next.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Db`] when the write fails. Nothing of the batch is then stored,
+    /// and the node must stop.
+    pub fn persist_all(&mut self, requests: &[Persist]) -> Result<(), StorageError> {
+        let Some(newest) = requests.last() else {
+            return Ok(());
+        };
+        let mut batch = WriteBatch::new();
+        // Only the newest hard state matters; each one replaces the one before.
+        batch.put(HARD_STATE_KEY, encode_hard_state(newest.hard_state()));
+
+        // The batch applies in order, so a later request overwrites what an earlier one in the
+        // same batch stored, exactly as it would across two writes.
         let mut base = self.base;
         let mut last_index = self.last_index;
-        if let Some(new_base) = persist.base() {
-            batch.put(BASE_KEY, encode_base(new_base));
-            // ponytail: one delete per entry, in the batch that moves the base. The batch grows
-            // with the distance between two compactions. A range delete in katman would make it
-            // constant; worth it once compactions are far apart.
-            let mut index = base.next();
-            while index <= new_base.index().min(last_index) {
-                batch.delete(log_key(index));
-                index = index.next();
+        for persist in requests {
+            if let Some(new_base) = persist.base() {
+                batch.put(BASE_KEY, encode_base(new_base));
+                // ponytail: one delete per entry, in the batch that moves the base. The batch
+                // grows with the distance between two compactions. A range delete in katman
+                // would make it constant; worth it once compactions are far apart.
+                let mut index = base.next();
+                while index <= new_base.index().min(last_index) {
+                    batch.delete(log_key(index));
+                    index = index.next();
+                }
+                base = new_base.index();
+                last_index = last_index.max(base);
             }
-            base = new_base.index();
-            last_index = last_index.max(base);
-        }
-        if let Some(write) = persist.log() {
-            let mut index = write.first_index();
-            for entry in write.entries() {
-                batch.put(log_key(index), encode_entry(entry));
-                index = index.next();
+            if let Some(write) = persist.log() {
+                let mut index = write.first_index();
+                for entry in write.entries() {
+                    batch.put(log_key(index), encode_entry(entry));
+                    index = index.next();
+                }
+                // `index` is now one past the new end. Whatever was stored from there on
+                // belonged to a log this node has given up.
+                let new_last = index.prev();
+                while index <= last_index {
+                    batch.delete(log_key(index));
+                    index = index.next();
+                }
+                last_index = new_last;
             }
-            // `index` is now one past the new end. Whatever was stored from there on belonged to
-            // a log this node has given up.
-            let new_last = index.prev();
-            while index <= last_index {
-                batch.delete(log_key(index));
-                index = index.next();
-            }
-            last_index = new_last;
         }
 
         self.db.write(batch)?;
@@ -367,6 +390,52 @@ mod tests {
         assert_eq!(
             reopen(&mut fs, storage).log,
             vec![entry(1, b"a"), entry(2, b"x"), entry(2, b"y")]
+        );
+    }
+
+    /// Several requests in one write have to leave the disk as they would have one by one,
+    /// including when a later one takes back what an earlier one stored.
+    #[test]
+    fn requests_written_together_end_up_as_if_written_one_by_one() {
+        let requests = [
+            request(
+                1,
+                None,
+                None,
+                Some((1, vec![entry(1, b"a"), entry(1, b"b"), entry(1, b"c")])),
+            ),
+            // Overwrites from index 2 with a shorter tail: index 3 has to go.
+            request(2, Some(2), None, Some((2, vec![entry(2, b"x")]))),
+            request(
+                2,
+                Some(2),
+                None,
+                Some((3, vec![entry(2, b"y"), entry(2, b"z")])),
+            ),
+            // The log is compacted up to index 2 in the same breath.
+            request(3, None, Some(base(2, 2)), None),
+            request(3, None, None, Some((5, vec![entry(3, b"w")]))),
+        ];
+
+        let mut one_by_one = SimFs::new();
+        let mut storage = open(&one_by_one).storage;
+        for persist in &requests {
+            storage.persist(persist).expect("write succeeds");
+        }
+        let expected = reopen(&mut one_by_one, storage);
+
+        let mut together = SimFs::new();
+        let mut storage = open(&together).storage;
+        storage.persist_all(&requests).expect("write succeeds");
+        let recovered = reopen(&mut together, storage);
+
+        assert_eq!(recovered.hard_state, expected.hard_state);
+        assert_eq!(recovered.hard_state, HardState::new(Term::new(3), None));
+        assert_eq!(recovered.base, expected.base);
+        assert_eq!(recovered.log, expected.log);
+        assert_eq!(
+            recovered.log,
+            vec![entry(2, b"y"), entry(2, b"z"), entry(3, b"w")]
         );
     }
 

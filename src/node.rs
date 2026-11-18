@@ -5,6 +5,7 @@
 //! it moves the bytes. That keeps everything here testable without a socket, and keeps the rules
 //! that matter in one place:
 //!
+//! - Writes that come up together go to disk together, with one sync.
 //! - A write is made durable, and only then is the core told. The core holds its messages until
 //!   it hears, so nothing leaves the node on the strength of state that could still be lost.
 //! - The state machine is forced to disk before the log is compacted, and a snapshot is installed
@@ -24,7 +25,7 @@ use crate::membership::Change;
 use crate::raft::{Raft, Role};
 use crate::state::StateMachine;
 use crate::storage::{Recovered, Storage, StorageError};
-use crate::types::{Index, Input, NodeId, Output, ReadId};
+use crate::types::{Index, Input, NodeId, Output, Persist, ReadId};
 use crate::wire::{ClientRequest, ClientResponse, PeerFrame, Status};
 
 /// Names one client connection for as long as it lasts.
@@ -138,8 +139,10 @@ pub(crate) struct Node {
     /// Reads the core has cleared, waiting for the state machine to reach their index.
     parked: Vec<(Index, ReadId)>,
     next_read: u64,
-    /// Membership changes handed to the core in the event being handled.
+    /// Membership changes handed to the core in the events being handled.
     changes: Vec<(Change, ConnId)>,
+    /// Writes the core has asked for and the disk has not seen yet.
+    unwritten: Vec<Persist>,
 }
 
 impl Node {
@@ -178,6 +181,7 @@ impl Node {
             parked: Vec::new(),
             next_read: 0,
             changes: Vec::new(),
+            unwritten: Vec::new(),
         })
     }
 
@@ -193,11 +197,47 @@ impl Node {
     }
 
     /// Reacts to one event and returns what has to be sent.
+    #[cfg(test)]
+    pub(crate) fn handle(&mut self, event: Event) -> Result<Vec<Effect>, NodeError> {
+        self.handle_all([event])
+    }
+
+    /// Reacts to several events at once and returns what has to be sent.
+    ///
+    /// Handing over everything that has piled up is what makes the node fast under load: the
+    /// writes all those events lead to reach the disk together, with one sync. While that sync
+    /// runs, the next batch of events piles up. A node with one client pays one sync per request,
+    /// and a node with a hundred pays hardly more.
     ///
     /// An error means the node can no longer trust its own state and must stop.
-    pub(crate) fn handle(&mut self, event: Event) -> Result<Vec<Effect>, NodeError> {
+    pub(crate) fn handle_all(
+        &mut self,
+        events: impl IntoIterator<Item = Event>,
+    ) -> Result<Vec<Effect>, NodeError> {
         let mut effects = Vec::new();
         let mut inputs = VecDeque::new();
+        for event in events {
+            self.take_in(event, &mut inputs, &mut effects)?;
+        }
+        self.work_off(&mut inputs, &mut effects)?;
+
+        // Whatever the core did not refuse, it took.
+        for (_, conn) in self.changes.drain(..) {
+            effects.push(Effect::ToClient {
+                conn,
+                response: ClientResponse::ChangeAccepted,
+            });
+        }
+        Ok(effects)
+    }
+
+    /// Turns an event into inputs for the core.
+    fn take_in(
+        &mut self,
+        event: Event,
+        inputs: &mut VecDeque<Input>,
+        effects: &mut Vec<Effect>,
+    ) -> Result<(), NodeError> {
         match event {
             Event::Tick => inputs.push_back(Input::Tick),
             Event::Peer {
@@ -226,33 +266,42 @@ impl Node {
                     membership: snapshot.membership().cloned().unwrap_or_default(),
                 });
             }
-            Event::Client { conn, request } => {
-                self.accept(conn, request, &mut inputs, &mut effects);
-            }
+            Event::Client { conn, request } => self.accept(conn, request, inputs, effects),
             Event::Disconnected(conn) => {
                 self.proposals.retain(|_, waiting| *waiting != conn);
                 self.reads.retain(|_, read| read.conn != conn);
             }
         }
+        Ok(())
+    }
 
-        // One input at a time, each to the end, before the next. A write that completes becomes
-        // an input at the back of the queue, not a step inside the step that asked for it.
-        while let Some(input) = inputs.pop_front() {
-            for output in self.raft.step(input) {
-                self.carry_out(output, &mut inputs, &mut effects)?;
+    /// Runs the core until it has nothing left to do, writing to disk each time it has caught up
+    /// with its inputs.
+    fn work_off(
+        &mut self,
+        inputs: &mut VecDeque<Input>,
+        effects: &mut Vec<Effect>,
+    ) -> Result<(), NodeError> {
+        loop {
+            // One input at a time, each to the end, before the next.
+            while let Some(input) = inputs.pop_front() {
+                for output in self.raft.step(input) {
+                    self.carry_out(output, effects)?;
+                }
+                self.serve_reads(effects)?;
+                self.maybe_compact(inputs)?;
             }
-            self.serve_reads(&mut effects)?;
-            self.maybe_compact(&mut inputs)?;
+            // The core has seen everything there is, and has asked for some writes on the way.
+            // They go to disk together. Only then is it told, and that may set it going again:
+            // messages it was holding back are released, entries become ready to apply.
+            let Some(newest) = self.unwritten.last() else {
+                return Ok(());
+            };
+            let seq = newest.seq();
+            self.storage.persist_all(&self.unwritten)?;
+            self.unwritten.clear();
+            inputs.push_back(Input::Persisted { seq });
         }
-
-        // Whatever the core did not refuse, it took.
-        for (_, conn) in self.changes.drain(..) {
-            effects.push(Effect::ToClient {
-                conn,
-                response: ClientResponse::ChangeAccepted,
-            });
-        }
-        Ok(effects)
     }
 
     /// Takes a client's request, or says straight away that this is the wrong node.
@@ -311,17 +360,10 @@ impl Node {
         }
     }
 
-    fn carry_out(
-        &mut self,
-        output: Output,
-        inputs: &mut VecDeque<Input>,
-        effects: &mut Vec<Effect>,
-    ) -> Result<(), NodeError> {
+    fn carry_out(&mut self, output: Output, effects: &mut Vec<Effect>) -> Result<(), NodeError> {
         match output {
-            Output::Persist(persist) => {
-                self.storage.persist(&persist)?;
-                inputs.push_back(Input::Persisted { seq: persist.seq() });
-            }
+            // Not written yet. The core is not told until it is, and holds its messages till then.
+            Output::Persist(persist) => self.unwritten.push(persist),
             Output::Send { to, message } => effects.push(Effect::ToPeer {
                 to,
                 frame: PeerFrame::Message(message),

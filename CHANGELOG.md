@@ -7,6 +7,9 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 - Repository scaffold, design document and roadmap.
 - Raft core as a pure state machine: leader election, log replication, a no-op entry on election and a conflict hint for fast log back-up. State is in memory only.
 - Durability: the core issues write requests and holds messages until they are reported durable. `Storage` keeps the term, vote and log in a katman database.
+- `quorate bench`, which measures clusters of real processes on the machine it runs on, and `docs/benchmarks.md` with the results.
+- Group commit: a node handles events in batches and syncs once per batch.
+- Frame limits per kind of connection; a frame's memory is taken as its bytes arrive.
 - A `quorate` binary: `serve` runs a node over TCP, the other commands are a client (`get`, `put`, `delete`, `cas`, `member`, `status`). `Client` is the same thing as a library.
 - A wire format with checksummed frames, and a test that kills the leader of a real cluster under load.
 - The linearizability checker is public under the `testkit` feature.

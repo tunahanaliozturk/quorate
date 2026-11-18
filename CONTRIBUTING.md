@@ -52,6 +52,8 @@ The rest follows the [Rust API Guidelines](https://rust-lang.github.io/api-guide
 
 ## Docs
 
+The diagrams in `docs/images` are drawn by `tools/diagram.py`. Change the script, not the images, and run it with `CHROME` pointing at a Chrome or Edge binary.
+
 English with British spelling, short sentences, no em dashes. Say why, not only what.
 
 ## Security

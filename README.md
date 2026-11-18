@@ -6,7 +6,7 @@ A meeting is *quorate* when enough members are present to make a binding decisio
 
 ## Status
 
-Milestones 1 to 7 of 8 are done. quorate runs: a `quorate` binary starts a node or talks to a cluster, over TCP, with data on disk. It is a study, not a product. There is no authentication and no encryption, and it has no benchmarks yet.
+All eight milestones are done. quorate runs: a `quorate` binary starts a node or talks to a cluster, over TCP, with data on disk. It is a study, not a product: there is no authentication and no encryption.
 
 ## Try it
 
@@ -35,7 +35,46 @@ Kill the node that `status` shows as leader, with `kill -9` or the task manager.
 
 `compose.yaml` starts the same three nodes in containers.
 
+## How it works
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/node-dark.png">
+  <img alt="Threads move bytes between sockets and the node. The node, owned by one thread, turns events into inputs for the Raft core and carries out its outputs: it writes to storage and then tells the core, and applies committed entries to the state machine." src="docs/images/node-light.png">
+</picture>
+
+The Raft core is a pure state machine. It reads no clock, opens no file and no socket; it is given inputs and returns what it wants done. The node around it does those things and nothing else, and the threads around the node only move bytes. That split is what lets the simulator run the same core for years of cluster time in a minute.
+
+A write, from request to answer:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/write-dark.png">
+  <img alt="The client sends a put to the leader. The leader appends and syncs it, and only then sends it to the followers. Each follower appends and syncs it, and only then acknowledges. With a majority the leader commits, applies and answers the client." src="docs/images/write-light.png">
+</picture>
+
+Nothing leaves a node on the strength of state that could still be lost. The leader does not send an entry before its own disk has it, and a follower does not acknowledge one before its disk has it.
+
+## Numbers
+
+One laptop, loopback, every node a separate process, all on one SSD. Full tables, the machine and the caveats are in [docs/benchmarks.md](docs/benchmarks.md).
+
+| | 3 nodes | 5 nodes |
+| --- | --- | --- |
+| puts per second, 1 client | 170 to 550 | 490 to 500 |
+| puts per second, 16 clients | 2,500 to 2,700 | 1,800 to 1,900 |
+| gets per second, 16 clients | 15,000 to 19,000 | 8,200 to 16,000 |
+| median put latency, 16 clients | 5 ms | 8 ms |
+
+Each range is two passes of the same benchmark; they differ that much on this machine. A killed leader is replaced, and writes go through again, in 0.5 to 1.0 seconds.
+
+Sixteen clients write faster than one because requests that arrive together share one sync. The first version did not do that and managed 170 puts a second however many clients there were; the benchmark is what showed it.
+
 ## What is tested
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/simulator-dark.png">
+  <img alt="One seed decides everything in a run. One thread holds the real core, storage and state machine of every node, a network it can reorder, disks that finish later, and clients that retry. Faults are injected, invariants are checked after every step, and at the end the logs, the histories and the state machines are compared." src="docs/images/simulator-light.png">
+</picture>
+
 
 A real cluster under fire, in `tests/kill.rs`: three processes, four clients, the leader killed four times. About 9,000 operations per run are answered and their history is linearizable.
 

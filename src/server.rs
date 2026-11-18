@@ -39,6 +39,9 @@ use crate::wire::{
 
 /// Frames waiting for one peer. When the peer is slow or away, newer frames are dropped.
 const PEER_QUEUE: usize = 1024;
+/// The most events the node takes on in one go. A bound, so that a flood of requests cannot keep
+/// the node from ticking.
+const BATCH: usize = 1024;
 /// How long a write to a client or a peer may block before the connection is given up.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a new connection has to say who it is.
@@ -163,7 +166,7 @@ fn run(
     let mut next_tick = Instant::now() + tick;
     loop {
         let now = Instant::now();
-        let event = if now >= next_tick {
+        let first = if now >= next_tick {
             // A node that was busy for a while ticks once, not once for every tick it missed.
             next_tick = (next_tick + tick).max(now);
             Event::Tick
@@ -173,7 +176,10 @@ fn run(
                 Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => continue,
             }
         };
-        for effect in node.handle(event)? {
+        // Together with whatever else is already waiting. Everything in one batch shares one
+        // write to disk, and while that write runs the next batch collects in the inbox.
+        let events = core::iter::once(first).chain(inbox.try_iter().take(BATCH - 1));
+        for effect in node.handle_all(events)? {
             match effect {
                 Effect::ToPeer { to, frame } => {
                     if let Some(link) = links.get(&to) {

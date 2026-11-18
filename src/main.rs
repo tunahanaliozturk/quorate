@@ -9,6 +9,8 @@ use std::process::ExitCode;
 
 use quorate::{Change, Client, ClientError, NodeId, ServerConfig, serve};
 
+mod bench;
+
 const USAGE: &str = "\
 quorate: a linearizable key-value store replicated with Raft
 
@@ -25,6 +27,9 @@ Use a cluster (give every node with --server N=ADDR):
   quorate cas KEY EXPECTED VALUE --server N=ADDR...     EXPECTED is - for \"must be absent\"
   quorate member add-learner|promote|remove N --server N=ADDR...
   quorate status --server N=ADDR...
+
+Measure this machine (starts its own clusters, takes a few minutes):
+  quorate bench [--seconds S] [--runs N] [--rounds N]
 ";
 
 /// What went wrong, as one line for the user.
@@ -126,6 +131,10 @@ fn run(args: &Args, out: &mut impl Write) -> Result<(), Failure> {
             tick: Duration::from_millis(tick.parse()?),
         };
         match serve(&config)? {}
+    }
+
+    if command == "bench" {
+        return bench::run(args, out);
     }
 
     let servers = args.nodes("server")?;

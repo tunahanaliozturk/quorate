@@ -83,7 +83,7 @@ A get can still be sent through the log like any other operation; the simulator 
 
 ### Node, transport and wire format
 
-A `Node` ties the core, the storage and the state machine together and does no I/O: events in, effects out. The server around it is threads and blocking sockets: one thread owns the node, the others read and write frames. Frames are length, CRC32C and payload; messages are encoded by hand, and a connection opens with a magic number and a version. Decoding accepts a buffer only if it is exactly one value, and never allocates on the word of a length it has not checked. See [ADR 0007](adr/0007-threads-and-blocking-sockets.md).
+A `Node` ties the core, the storage and the state machine together and does no I/O: events in, effects out. It takes events in batches and writes once per batch, so that requests arriving together share one sync ([ADR 0008](adr/0008-group-commit-at-the-node.md)). The server around it is threads and blocking sockets: one thread owns the node, the others read and write frames. Frames are length, CRC32C and payload; messages are encoded by hand, and a connection opens with a magic number and a version. Decoding accepts a buffer only if it is exactly one value, and never allocates on the word of a length it has not checked. See [ADR 0007](adr/0007-threads-and-blocking-sockets.md).
 
 ### Server and client
 
@@ -145,14 +145,7 @@ A node stops, loudly, when storage reports corruption or when an invariant fails
 
 ## Benchmarks
 
-Published in `docs/benchmarks.md` at M8, with the hardware and the commands:
-
-- Write throughput and p50/p99 latency for a three-node and a five-node cluster on one machine, with fsync on.
-- Read throughput with ReadIndex.
-- Time to elect a new leader after the old one is killed.
-- Simulator speed: simulated cluster seconds per wall-clock second.
-
-No target numbers are claimed before they are measured.
+`quorate bench` starts clusters of real processes on the machine it runs on and measures write and read throughput with latency percentiles, on three and five nodes, and the time from killing a leader to the next acknowledged write. The results, the machine, and how far the numbers can be trusted are in [benchmarks.md](benchmarks.md).
 
 ## Dependencies
 
