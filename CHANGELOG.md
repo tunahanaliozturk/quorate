@@ -4,6 +4,10 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 ## Unreleased
 
+## 0.1.0 - 2026-11-18
+
+The first release. It is tagged on GitHub and not published to crates.io, because katman is a git dependency.
+
 - Repository scaffold, design document and roadmap.
 - Raft core as a pure state machine: leader election, log replication, a no-op entry on election and a conflict hint for fast log back-up. State is in memory only.
 - Durability: the core issues write requests and holds messages until they are reported durable. `Storage` keeps the term, vote and log in a katman database.
